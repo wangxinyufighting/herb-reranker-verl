@@ -88,6 +88,8 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.model.use_remove_padding=True \
   actor_rollout_ref.model.enable_gradient_checkpointing=True \
   actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
+  actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03 \
+  actor_rollout_ref.rollout.free_cache_engine=True \
   actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.actor.use_kl_loss=True \
@@ -107,7 +109,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
-  actor_rollout_ref.ref.fsdp_config.param_offload=True \
+  actor_rollout_ref.ref.fsdp_config.param_offload=False \
   reward.reward_manager.name=naive \
   reward.custom_reward_function.path="${PROJECT_ROOT}/herb_reranker/reward.py" \
   reward.custom_reward_function.name=compute_score \
@@ -120,7 +122,7 @@ python3 -m verl.trainer.main_ppo \
   +reward.custom_reward_function.reward_kwargs.format_weight=0.05 \
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
-  trainer.logger="['console']" \
+  trainer.logger="['console', 'swanlab']" \
   trainer.n_gpus_per_node="${NGPUS_PER_NODE}" \
   trainer.nnodes=1 \
   trainer.val_before_train=True \
