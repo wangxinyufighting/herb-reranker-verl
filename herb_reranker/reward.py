@@ -157,24 +157,33 @@ def _extract_json_ranking(solution: Any) -> tuple[list[Any], float, float]:
 
 def _map_index_ranking(
     raw_ranking: Sequence[Any], candidates: Sequence[str]
-) -> tuple[list[str | None], list[str]]:
+) -> tuple[list[str | None], list[str], dict[str, int]]:
     """把 1-based 候选序号映射成药名，同时保留非法位置。
 
     ``metric_ranking`` 中的 ``None`` 会作为一次错误占位，因此重复、越界、布尔值、
     字符串序号都不能通过过滤非法项而获得更靠前的名次。``valid_unique`` 只用于计算
-    输出合法率和候选覆盖率。
+    输出合法率和候选覆盖率。第三个返回值拆分记录重复、非法和遗漏序号，便于定位
+    模型究竟在哪一种约束上失败。
     """
 
     metric_ranking: list[str | None] = []
     valid_unique: list[str] = []
     seen_indices: set[int] = set()
+    duplicate_count = 0
+    invalid_count = 0
 
     for item in raw_ranking:
         # bool 是 int 的子类，必须显式排除，避免 true/false 被当成 1/0。
         if isinstance(item, bool) or not isinstance(item, int):
+            invalid_count += 1
             metric_ranking.append(None)
             continue
-        if item < 1 or item > len(candidates) or item in seen_indices:
+        if item < 1 or item > len(candidates):
+            invalid_count += 1
+            metric_ranking.append(None)
+            continue
+        if item in seen_indices:
+            duplicate_count += 1
             metric_ranking.append(None)
             continue
 
@@ -183,7 +192,27 @@ def _map_index_ranking(
         metric_ranking.append(herb)
         valid_unique.append(herb)
 
-    return metric_ranking, valid_unique
+    diagnostics = {
+        "duplicate_index_count": duplicate_count,
+        "invalid_index_count": invalid_count,
+        "missing_index_count": max(0, len(candidates) - len(valid_unique)),
+    }
+    return metric_ranking, valid_unique, diagnostics
+
+
+def _copy_ratio_at_k(
+    ranking: Sequence[str | None], candidates: Sequence[str], cutoff: int
+) -> float:
+    """前 k 个位置与 GNN 原排序完全相同的比例，仅作为诊断而不参与奖励。"""
+
+    compared = min(cutoff, len(candidates))
+    if compared <= 0:
+        return 0.0
+    matches = sum(
+        rank < len(ranking) and ranking[rank] == candidates[rank]
+        for rank in range(compared)
+    )
+    return matches / compared
 
 
 def _precision_at_k(
@@ -257,7 +286,9 @@ def compute_score(
 
     raw_ranking, json_ok, list_ok = _extract_json_ranking(solution_str)
     raw_output_count = len(raw_ranking)
-    model_ranking, valid_unique = _map_index_ranking(raw_ranking, candidates)
+    model_ranking, valid_unique, index_diagnostics = _map_index_ranking(
+        raw_ranking, candidates
+    )
 
     candidate_count = len(candidates)
     # 分母使用原始数组长度，使重复、越界、字符串和空值都受到惩罚，不能在过滤后“消失”。
@@ -295,6 +326,22 @@ def compute_score(
         for cutoff in cutoffs
     }
 
+    # Oracle 只能重排当前候选，不能引入候选外 GT。它给出固定 retriever 下的理论上限。
+    oracle_ranking = [herb for herb in candidates if herb in relevant]
+    oracle_ranking.extend(herb for herb in candidates if herb not in relevant)
+    oracle_precision = {
+        cutoff: _precision_at_k(oracle_ranking, relevant, cutoff)
+        for cutoff in cutoffs
+    }
+    oracle_recall = {
+        cutoff: _recall_at_k(oracle_ranking, target_set, cutoff)
+        for cutoff in cutoffs
+    }
+    oracle_ndcg = {
+        cutoff: _ndcg_at_k(oracle_ranking, target_set, cutoff)
+        for cutoff in cutoffs
+    }
+
     # GNN 原始候选顺序是不经过训练的 test baseline。验证时返回其指标，SwanLab
     # 会与模型指标一起按测试集求均值，因此无需修改 VERL 或额外跑一遍评测脚本。
     gnn_precision = {
@@ -309,6 +356,10 @@ def compute_score(
         cutoff: _ndcg_at_k(candidates, target_set, cutoff)
         for cutoff in cutoffs
     }
+    gnn_reward_ndcg = {
+        cutoff: _ndcg_at_k(candidates, relevant, cutoff)
+        for cutoff in cutoffs
+    }
     use_hierarchical = _as_bool(kwargs.get("use_hierarchical_reward", True))
     epsilon = _clip(float(kwargs.get("hierarchical_epsilon", 0.1)))
     gate_5 = competence_gate(reward_ndcg[5], epsilon)
@@ -321,11 +372,25 @@ def compute_score(
             ndcg_20=reward_ndcg[20],
             epsilon=epsilon,
         )
+        gnn_rank_score = hierarchical_rank_reward(
+            ndcg_5=gnn_reward_ndcg[5],
+            ndcg_10=gnn_reward_ndcg[10],
+            ndcg_20=gnn_reward_ndcg[20],
+            epsilon=epsilon,
+        )
     else:
         rank_score = fixed_joint_rank_reward(
             ndcg_5=reward_ndcg[5],
             ndcg_10=reward_ndcg[10],
             ndcg_20=reward_ndcg[20],
+            weight_5=float(kwargs.get("fixed_weight_5", 0.4)),
+            weight_10=float(kwargs.get("fixed_weight_10", 0.3)),
+            weight_20=float(kwargs.get("fixed_weight_20", 0.3)),
+        )
+        gnn_rank_score = fixed_joint_rank_reward(
+            ndcg_5=gnn_reward_ndcg[5],
+            ndcg_10=gnn_reward_ndcg[10],
+            ndcg_20=gnn_reward_ndcg[20],
             weight_5=float(kwargs.get("fixed_weight_5", 0.4)),
             weight_10=float(kwargs.get("fixed_weight_10", 0.3)),
             weight_20=float(kwargs.get("fixed_weight_20", 0.3)),
@@ -354,6 +419,9 @@ def compute_score(
     metrics = {
         "score": float(total_score),
         "rank_score": float(rank_score),
+        # 相对基线只用于解释；GRPO 组内归一化会抵消同一病例的常数基线。
+        "gnn_rank_score": float(gnn_rank_score),
+        "rank_delta": float(rank_score - gnn_rank_score),
         # 保留旧键名，避免已有 SwanLab 面板和分析脚本失效。
         "ndcg_5": float(reward_ndcg[5]),
         "ndcg_10": float(reward_ndcg[10]),
@@ -368,16 +436,31 @@ def compute_score(
         "constraint_quality": float(constraint_quality),
         "exact_permutation": float(exact_permutation),
         "reachable_gt_count": float(len(relevant)),
+        "duplicate_index_count": float(index_diagnostics["duplicate_index_count"]),
+        "invalid_index_count": float(index_diagnostics["invalid_index_count"]),
+        "missing_index_count": float(index_diagnostics["missing_index_count"]),
     }
     for cutoff in cutoffs:
-        for metric_name, model_values, gnn_values in (
-            ("precision", model_precision, gnn_precision),
-            ("recall", model_recall, gnn_recall),
-            ("ndcg", model_ndcg, gnn_ndcg),
+        copy_ratio = _copy_ratio_at_k(model_ranking, candidates, cutoff)
+        metrics[f"copy_ratio_{cutoff}"] = copy_ratio
+        metrics[f"exact_copy_{cutoff}"] = float(
+            exact_permutation == 1.0 and copy_ratio == 1.0
+        )
+
+        for metric_name, model_values, gnn_values, oracle_values in (
+            ("precision", model_precision, gnn_precision, oracle_precision),
+            ("recall", model_recall, gnn_recall, oracle_recall),
+            ("ndcg", model_ndcg, gnn_ndcg, oracle_ndcg),
         ):
             model_value = float(model_values[cutoff])
             gnn_value = float(gnn_values[cutoff])
+            oracle_value = float(oracle_values[cutoff])
             metrics[f"model_{metric_name}_{cutoff}"] = model_value
             metrics[f"gnn_{metric_name}_{cutoff}"] = gnn_value
+            metrics[f"oracle_{metric_name}_{cutoff}"] = oracle_value
             metrics[f"delta_{metric_name}_{cutoff}"] = model_value - gnn_value
+            metrics[f"headroom_{metric_name}_{cutoff}"] = oracle_value - gnn_value
+            metrics[f"remaining_gap_{metric_name}_{cutoff}"] = (
+                oracle_value - model_value
+            )
     return metrics
