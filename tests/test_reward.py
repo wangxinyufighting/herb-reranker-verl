@@ -57,6 +57,9 @@ class RewardTest(unittest.TestCase):
         result = self.score(output(INDEX_RANKING))
         self.assertAlmostEqual(result["score"], 1.0)
         self.assertEqual(result["exact_permutation"], 1.0)
+        for cutoff in (5, 10, 15, 20):
+            self.assertEqual(result[f"copy_ratio_{cutoff}"], 1.0)
+            self.assertEqual(result[f"exact_copy_{cutoff}"], 1.0)
 
     def test_poor_head_ranking_scores_lower(self) -> None:
         poor = list(range(4, 21)) + [1, 2, 3]
@@ -112,6 +115,9 @@ class RewardTest(unittest.TestCase):
         self.assertLess(result["candidate_precision"], 1.0)
         self.assertLess(result["candidate_coverage"], 1.0)
         self.assertEqual(result["exact_permutation"], 0.0)
+        self.assertEqual(result["duplicate_index_count"], 1.0)
+        self.assertEqual(result["invalid_index_count"], 1.0)
+        self.assertEqual(result["missing_index_count"], 1.0)
 
     def test_non_integer_item_cannot_be_filtered_away(self) -> None:
         malformed = json.dumps({"ranking": INDEX_RANKING + [None]}, ensure_ascii=False)
@@ -122,6 +128,8 @@ class RewardTest(unittest.TestCase):
     def test_string_indices_are_rejected(self) -> None:
         result = self.score(output([str(index) for index in INDEX_RANKING]))
         self.assertEqual(result["candidate_coverage"], 0.0)
+        self.assertEqual(result["invalid_index_count"], 20.0)
+        self.assertEqual(result["missing_index_count"], 20.0)
         self.assertAlmostEqual(result["score"], 0.02)
 
     def test_qwen_think_wrapper_can_be_parsed(self) -> None:
@@ -137,6 +145,16 @@ class RewardTest(unittest.TestCase):
                     result[f"delta_{metric}_{cutoff}"],
                     result[f"model_{metric}_{cutoff}"]
                     - result[f"gnn_{metric}_{cutoff}"],
+                )
+                self.assertAlmostEqual(
+                    result[f"headroom_{metric}_{cutoff}"],
+                    result[f"oracle_{metric}_{cutoff}"]
+                    - result[f"gnn_{metric}_{cutoff}"],
+                )
+                self.assertAlmostEqual(
+                    result[f"remaining_gap_{metric}_{cutoff}"],
+                    result[f"oracle_{metric}_{cutoff}"]
+                    - result[f"model_{metric}_{cutoff}"],
                 )
 
         self.assertAlmostEqual(result["model_precision_5"], 3 / 5)
@@ -157,6 +175,35 @@ class RewardTest(unittest.TestCase):
         self.assertAlmostEqual(
             result["delta_ndcg_5"], -result["gnn_ndcg_5"]
         )
+
+    def test_oracle_exposes_retriever_headroom(self) -> None:
+        poor_candidates = [f"药{i}" for i in range(4, 21)] + ["药1", "药2", "药3"]
+        oracle_indices = [18, 19, 20] + list(range(1, 18))
+        result = compute_score(
+            data_source="ptm_herb_rerank",
+            solution_str=output(oracle_indices),
+            ground_truth=GROUND_TRUTH,
+            extra_info={"candidate_herbs": poor_candidates},
+            use_hierarchical_reward=True,
+        )
+
+        for cutoff in (5, 10, 15, 20):
+            for metric in ("precision", "recall", "ndcg"):
+                self.assertAlmostEqual(
+                    result[f"model_{metric}_{cutoff}"],
+                    result[f"oracle_{metric}_{cutoff}"],
+                )
+                self.assertAlmostEqual(
+                    result[f"delta_{metric}_{cutoff}"],
+                    result[f"headroom_{metric}_{cutoff}"],
+                )
+                self.assertAlmostEqual(
+                    result[f"remaining_gap_{metric}_{cutoff}"], 0.0
+                )
+
+        self.assertGreater(result["rank_delta"], 0.0)
+        self.assertEqual(result["copy_ratio_20"], 0.0)
+        self.assertEqual(result["exact_copy_20"], 0.0)
 
 
 if __name__ == "__main__":
