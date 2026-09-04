@@ -155,7 +155,62 @@ def _extract_json_ranking(solution: Any) -> tuple[list[Any], float, float]:
     return [], float(saw_json_object), 0.0
 
 
-def _ndcg_at_k(ranking: Sequence[str], relevant: set[str], cutoff: int) -> float:
+def _map_index_ranking(
+    raw_ranking: Sequence[Any], candidates: Sequence[str]
+) -> tuple[list[str | None], list[str]]:
+    """把 1-based 候选序号映射成药名，同时保留非法位置。
+
+    ``metric_ranking`` 中的 ``None`` 会作为一次错误占位，因此重复、越界、布尔值、
+    字符串序号都不能通过过滤非法项而获得更靠前的名次。``valid_unique`` 只用于计算
+    输出合法率和候选覆盖率。
+    """
+
+    metric_ranking: list[str | None] = []
+    valid_unique: list[str] = []
+    seen_indices: set[int] = set()
+
+    for item in raw_ranking:
+        # bool 是 int 的子类，必须显式排除，避免 true/false 被当成 1/0。
+        if isinstance(item, bool) or not isinstance(item, int):
+            metric_ranking.append(None)
+            continue
+        if item < 1 or item > len(candidates) or item in seen_indices:
+            metric_ranking.append(None)
+            continue
+
+        seen_indices.add(item)
+        herb = candidates[item - 1]
+        metric_ranking.append(herb)
+        valid_unique.append(herb)
+
+    return metric_ranking, valid_unique
+
+
+def _precision_at_k(
+    ranking: Sequence[str | None], relevant: set[str], cutoff: int
+) -> float:
+    """标准 Precision@k；输出不足 k 个位置时，缺失位置按未命中处理。"""
+
+    if cutoff <= 0:
+        return 0.0
+    hits = sum(herb in relevant for herb in ranking[:cutoff])
+    return hits / cutoff
+
+
+def _recall_at_k(
+    ranking: Sequence[str | None], ground_truth: set[str], cutoff: int
+) -> float:
+    """标准端到端 Recall@k，分母包含候选集未召回的 GT。"""
+
+    if not ground_truth or cutoff <= 0:
+        return 0.0
+    hits = sum(herb in ground_truth for herb in ranking[:cutoff])
+    return hits / len(ground_truth)
+
+
+def _ndcg_at_k(
+    ranking: Sequence[str | None], relevant: set[str], cutoff: int
+) -> float:
     """计算二元相关性的 NDCG@cutoff；没有可达 GT 时返回 0。"""
 
     if not relevant or cutoff <= 0:
@@ -202,20 +257,10 @@ def compute_score(
 
     raw_ranking, json_ok, list_ok = _extract_json_ranking(solution_str)
     raw_output_count = len(raw_ranking)
-    output_items = [item.strip() for item in raw_ranking if isinstance(item, str) and item.strip()]
-
-    # 只保留候选内中药的第一次出现；随后按 GNN 原顺序补齐遗漏项。
-    # 补齐只用于定义稳定的排序指标，constraint_quality 会单独惩罚遗漏、重复与越界。
-    seen: set[str] = set()
-    valid_unique: list[str] = []
-    for herb in output_items:
-        if herb in candidate_set and herb not in seen:
-            seen.add(herb)
-            valid_unique.append(herb)
-    completed_ranking = valid_unique + [herb for herb in candidates if herb not in seen]
+    model_ranking, valid_unique = _map_index_ranking(raw_ranking, candidates)
 
     candidate_count = len(candidates)
-    # 分母使用原始数组长度，使 null、数字和空字符串同样受到惩罚，不能在过滤后“消失”。
+    # 分母使用原始数组长度，使重复、越界、字符串和空值都受到惩罚，不能在过滤后“消失”。
     candidate_precision = len(valid_unique) / max(raw_output_count, 1)
     candidate_coverage = len(valid_unique) / candidate_count if candidate_count else 0.0
     constraint_quality = candidate_precision * candidate_coverage
@@ -227,27 +272,60 @@ def compute_score(
         and len(valid_unique) == candidate_count
     )
 
-    ndcg = {
-        cutoff: _ndcg_at_k(completed_ranking, relevant, cutoff)
-        for cutoff in (5, 10, 20)
+    cutoffs = (5, 10, 15, 20)
+    target_set = set(targets)
+    model_precision = {
+        cutoff: _precision_at_k(model_ranking, relevant, cutoff)
+        for cutoff in cutoffs
+    }
+    model_recall = {
+        cutoff: _recall_at_k(model_ranking, target_set, cutoff)
+        for cutoff in cutoffs
+    }
+    # reward_ndcg 只评价候选内部排序；这是标量 reward 使用的条件化 NDCG。
+    reward_ndcg = {
+        cutoff: _ndcg_at_k(model_ranking, relevant, cutoff)
+        for cutoff in cutoffs
+    }
+
+    # model/gnn NDCG 是论文测试口径：IDCG 使用完整 GT。这样三类 test 指标
+    # （Precision、Recall、NDCG）都包含 retriever 的召回上限，可与原 GNN 直接比较。
+    model_ndcg = {
+        cutoff: _ndcg_at_k(model_ranking, target_set, cutoff)
+        for cutoff in cutoffs
+    }
+
+    # GNN 原始候选顺序是不经过训练的 test baseline。验证时返回其指标，SwanLab
+    # 会与模型指标一起按测试集求均值，因此无需修改 VERL 或额外跑一遍评测脚本。
+    gnn_precision = {
+        cutoff: _precision_at_k(candidates, relevant, cutoff)
+        for cutoff in cutoffs
+    }
+    gnn_recall = {
+        cutoff: _recall_at_k(candidates, target_set, cutoff)
+        for cutoff in cutoffs
+    }
+    gnn_ndcg = {
+        cutoff: _ndcg_at_k(candidates, target_set, cutoff)
+        for cutoff in cutoffs
     }
     use_hierarchical = _as_bool(kwargs.get("use_hierarchical_reward", True))
     epsilon = _clip(float(kwargs.get("hierarchical_epsilon", 0.1)))
-    gate_5 = competence_gate(ndcg[5], epsilon)
-    gate_10 = competence_gate(ndcg[10], epsilon)
+    gate_5 = competence_gate(reward_ndcg[5], epsilon)
+    gate_10 = competence_gate(reward_ndcg[10], epsilon)
 
     if use_hierarchical:
         rank_score = hierarchical_rank_reward(
-            ndcg_5=ndcg[5],
-            ndcg_10=ndcg[10],
-            ndcg_20=ndcg[20],
+            ndcg_5=reward_ndcg[5],
+            ndcg_10=reward_ndcg[10],
+            ndcg_20=reward_ndcg[20],
             epsilon=epsilon,
         )
     else:
         rank_score = fixed_joint_rank_reward(
-            ndcg_5=ndcg[5],
-            ndcg_10=ndcg[10],
-            ndcg_20=ndcg[20],
+            ndcg_5=reward_ndcg[5],
+            ndcg_10=reward_ndcg[10],
+            ndcg_20=reward_ndcg[20],
             weight_5=float(kwargs.get("fixed_weight_5", 0.4)),
             weight_10=float(kwargs.get("fixed_weight_10", 0.3)),
             weight_20=float(kwargs.get("fixed_weight_20", 0.3)),
@@ -271,13 +349,16 @@ def compute_score(
 
     total_score = rank_weight * rank_score * constraint_quality + format_weight * format_score
 
-    # score 是 VERL 使用的主奖励，其余标量会进入 reward_extra_info 便于监控和消融。
-    return {
+    # score 是 VERL 使用的主奖励。Precision/Recall 只作为 reward extra metrics
+    # 监控，不直接叠加到标量奖励，避免与二元 NDCG 中的命中数重复计权。
+    metrics = {
         "score": float(total_score),
         "rank_score": float(rank_score),
-        "ndcg_5": float(ndcg[5]),
-        "ndcg_10": float(ndcg[10]),
-        "ndcg_20": float(ndcg[20]),
+        # 保留旧键名，避免已有 SwanLab 面板和分析脚本失效。
+        "ndcg_5": float(reward_ndcg[5]),
+        "ndcg_10": float(reward_ndcg[10]),
+        "ndcg_15": float(reward_ndcg[15]),
+        "ndcg_20": float(reward_ndcg[20]),
         "gate_5": float(gate_5),
         "gate_10": float(gate_10),
         "hierarchical_reward_enabled": float(use_hierarchical),
@@ -288,3 +369,15 @@ def compute_score(
         "exact_permutation": float(exact_permutation),
         "reachable_gt_count": float(len(relevant)),
     }
+    for cutoff in cutoffs:
+        for metric_name, model_values, gnn_values in (
+            ("precision", model_precision, gnn_precision),
+            ("recall", model_recall, gnn_recall),
+            ("ndcg", model_ndcg, gnn_ndcg),
+        ):
+            model_value = float(model_values[cutoff])
+            gnn_value = float(gnn_values[cutoff])
+            metrics[f"model_{metric_name}_{cutoff}"] = model_value
+            metrics[f"gnn_{metric_name}_{cutoff}"] = gnn_value
+            metrics[f"delta_{metric_name}_{cutoff}"] = model_value - gnn_value
+    return metrics
