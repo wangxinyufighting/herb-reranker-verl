@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any
 
 
-SYSTEM_PROMPT = """你是一个中药候选重排器。请依据规范症状、原始症状描述和 GNN 候选列表，重新排列候选中药。
+SYSTEM_PROMPT = """你是一个中药候选重排器。请依据规范症状、原始症状描述和 GNN 候选列表，输出候选序号的新顺序。
 必须遵守以下规则：
-1. 只能使用候选列表中的中药；
-2. 每味候选中药必须且只能出现一次；
-3. 不得增加或删除候选中药；
+1. ranking 中只能输出整数序号，不得输出药名；
+2. 每个候选序号必须且只能出现一次；
+3. 不得增加、删除或重复序号；
 4. 越相关的中药排得越靠前；
 5. 只输出一行合法 JSON，不要解释。"""
 
@@ -46,7 +46,9 @@ def _build_user_prompt(
         "GNN 候选中药（当前顺序仅作为召回器先验）：\n"
         f"{numbered_candidates}\n"
         f"请只输出一个含 ranking 字段的 JSON 对象；ranking 必须是长度为 "
-        f"{len(candidate_herbs)} 的字符串数组，并包含上述全部候选的新顺序。"
+        f"{len(candidate_herbs)} 的整数数组，并且是 1 到 {len(candidate_herbs)} "
+        "所有序号的一个完整排列。不得输出药名。\n"
+        '输出示例：{"ranking":[3,1,2,4]}（示例仅说明格式，实际必须输出全部序号）。'
     )
 
 
