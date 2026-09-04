@@ -25,6 +25,9 @@ class PrepareDataTest(unittest.TestCase):
         self.assertEqual(row["reward_model"]["ground_truth"]["ground_truth_herbs"][-1], "不会进入提示词的真实药")
         prompt_text = "\n".join(message["content"] for message in row["prompt"])
         self.assertNotIn("不会进入提示词的真实药", prompt_text)
+        self.assertIn("整数数组", prompt_text)
+        self.assertIn("1 到 20", prompt_text)
+        self.assertIn("不得输出药名", prompt_text)
 
     def test_duplicate_candidates_raise_error(self) -> None:
         record = example_record()
