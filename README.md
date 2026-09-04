@@ -210,6 +210,10 @@ FILTER_MODE=exact bash scripts/filter_train_by_test.sh
 }
 ```
 
+提示词会直接写入 Parquet。若从旧版“输出药名”协议升级到当前“输出序号”协议，必须
+重新构建 train/test Parquet；若还使用测试相关训练子集，也要在重建后重新执行筛选。
+旧 checkpoint 已学习药名输出协议，不应恢复到新实验中。
+
 ## 5. 评测指标
 
 设候选集为 $C$，真实药方为 $Y^*$，可达 GT 为：
