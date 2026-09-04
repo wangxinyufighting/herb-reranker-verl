@@ -49,11 +49,12 @@ herb-reranker-verl/
 模型只能重排候选中药，输出格式为：
 
 ```json
-{"ranking":["当归","川芎","白芍"]}
+{"ranking":[3,1,2,4]}
 ```
 
-输出必须是候选全集的一个排列，不能增加、删除或重复中药。因此本方法不进行处方长度
-预测，也不包含 length reward。
+序号采用 1-based 编号，`1` 对应候选列表中的第 1 味药。输出必须是 `1..K` 的完整
+排列，不能增加、删除、重复序号，也不能直接输出药名。因此本方法不进行处方长度预测，
+也不包含 length reward。序号协议显著缩短输出，并避免长药名引发的重复和截断错误。
 
 ## 3. 原始数据格式
 
@@ -122,7 +123,8 @@ data/processed/test_top50.parquet
 CANDIDATE_K=200 bash scripts/build_test_parquet.sh
 ```
 
-重排 200 味时，应同步设置 `MAX_RESPONSE_LENGTH=2048`。当前测试源数据中，
+序号输出下，Top-50 建议从 `MAX_RESPONSE_LENGTH=256` 开始，Top-200 建议从 1024
+开始并根据 `response_length/clip_ratio` 调整。当前测试源数据中，
 Top-50/100/200 的 GT micro recall 分别约为 0.6754、0.8204 和 0.9274。
 
 对齐过程会强制检查：
@@ -208,7 +210,7 @@ FILTER_MODE=exact bash scripts/filter_train_by_test.sh
 }
 ```
 
-## 5. 候选集归一化 NDCG
+## 5. 评测指标
 
 设候选集为 $C$，真实药方为 $Y^*$，可达 GT 为：
 
@@ -216,7 +218,7 @@ $$
 R=Y^*\cap C.
 $$
 
-所有 NDCG 只使用 $R$。因此，GNN 没有召回的真实中药不会错误地惩罚 reranker。
+标量排序奖励中的 NDCG 只使用 $R$：
 
 $$
 \mathrm{NDCG@h}=\frac{
@@ -225,6 +227,30 @@ $$
 \sum_{i=1}^{\min(h,|R|)}\frac{1}{\log_2(i+1)}
 }.
 $$
+
+这使 GNN 没有召回的真实中药不会错误地惩罚 reranker，它衡量的是固定候选集内部的
+排序能力。代码中旧键 `ndcg_5/10/15/20` 对应这套 reward 口径。
+
+同时监控标准的端到端 Precision 和 Recall：
+
+$$
+\mathrm{Precision@h}=\frac{|P_{1:h}\cap Y^*|}{h},\qquad
+\mathrm{Recall@h}=\frac{|P_{1:h}\cap Y^*|}{|Y^*|}.
+$$
+
+测试监控则使用标准的端到端 Precision、Recall 和 NDCG；三者的相关集合及 IDCG
+都基于完整 $Y^*$：
+
+$$
+\mathrm{NDCG@h}_{\mathrm{test}}=\frac{
+\sum_{i=1}^{\min(h,K)}\frac{\mathbb{I}[p_i\in Y^*]}{\log_2(i+1)}
+}{
+\sum_{i=1}^{\min(h,|Y^*|)}\frac{1}{\log_2(i+1)}
+}.
+$$
+
+因此，测试 Recall 和 NDCG 都会反映 GNN 的候选召回上限；同一测试病例上，原始 GNN
+与模型重排使用完全相同的分母，二者差值只反映排序变化。
 
 记：
 
@@ -282,13 +308,41 @@ $$
 
 - `q_constraint` 同时考虑候选合法率和候选覆盖率；
 - `r_format` 提供很小的稠密格式反馈；
-- 漏项、重复项、非字符串元素和候选外中药都会降低奖励；
+- 漏项、重复项、非整数或越界序号都会降低奖励；
 - 完整合法且排序理想时，总奖励为 1。
 
-奖励函数额外返回 `ndcg_5/10/20`、`gate_5/10`、`candidate_coverage`、
-`exact_permutation` 等指标，供 VERL 日志记录和实验分析。
+Precision 和 Recall 已由 reward 函数计算并返回，但默认不再叠加进标量 reward。
+原因是固定 cutoff 下二者都主要由命中数量决定，直接与二元 NDCG 相加会重复计权并
+削弱对头部位置的敏感性。标量 reward 仍由层级 NDCG 与格式约束组成。
 
-## 9. 安装与数据准备
+奖励函数还返回 `gate_5/10`、`candidate_coverage`、`exact_permutation` 等指标，供
+VERL 日志记录和实验分析。
+
+## 9. 每 N 步监控测试集重排效果
+
+`VAL_FILES` 指定测试 Parquet，`TEST_FREQ=N` 控制每 N 个训练 step 进行一次确定性
+greedy 验证。验证只生成 1 个排序，避免采样噪声：
+
+```bash
+VAL_FILES=data/processed/test_top50.parquet \
+TEST_FREQ=20 \
+bash scripts/train.sh
+```
+
+每次验证都会在 cutoff `5/10/15/20` 上同时记录三组指标：
+
+| SwanLab 变量名 | 含义 |
+|---|---|
+| `gnn_precision_k`, `gnn_recall_k`, `gnn_ndcg_k` | GNN 原始候选顺序；训练中应保持不变 |
+| `model_precision_k`, `model_recall_k`, `model_ndcg_k` | 当前模型重排结果 |
+| `delta_precision_k`, `delta_recall_k`, `delta_ndcg_k` | `model - gnn`；大于 0 表示重排改善 |
+
+在当前 VERL 中它们会显示为
+`val-aux/ptm_herb_rerank/<变量名>/mean@1`。例如模型的 NDCG@10 是
+`val-aux/ptm_herb_rerank/model_ndcg_10/mean@1`。GNN 指标也在每次验证时计算，
+但只依赖固定测试数据，因此曲线应为水平线。
+
+## 10. 安装与数据准备
 
 先根据 VERL 官方说明安装其运行环境。本工程按照以下 VERL 提交核对接口：
 
@@ -310,9 +364,9 @@ bash scripts/prepare_data.sh
 
 正式论文实验建议再独立划分 validation/test，不使用 test 集调参。
 
-## 10. 启动训练
+## 11. 启动训练
 
-### 10.1 开启能力门控：本文方法
+### 11.1 开启能力门控：本文方法
 
 ```bash
 VERL_ROOT=/path/to/verl \
@@ -321,7 +375,7 @@ HIERARCHICAL_REWARD=on \
 bash scripts/train.sh
 ```
 
-### 10.2 关闭能力门控：固定联合奖励
+### 11.2 关闭能力门控：固定联合奖励
 
 ```bash
 VERL_ROOT=/path/to/verl \
@@ -339,7 +393,7 @@ checkpoints/Qwen3-0.6B-grpo-fixed/
 
 避免两个实验错误地恢复彼此的 checkpoint。
 
-### 10.3 使用 Qwen3-1.7B
+### 11.3 使用 Qwen3-1.7B
 
 ```bash
 VERL_ROOT=/path/to/verl \
@@ -348,7 +402,7 @@ HIERARCHICAL_REWARD=on \
 bash scripts/train.sh
 ```
 
-### 10.4 单卡显存不足
+### 11.4 单卡显存不足
 
 ```bash
 VERL_ROOT=/path/to/verl \
@@ -361,7 +415,7 @@ GPU_MEMORY_UTILIZATION=0.45 \
 bash scripts/train.sh
 ```
 
-## 11. 测试
+## 12. 测试
 
 奖励函数仅依赖 Python 标准库，可以脱离 VERL 单独验证：
 
@@ -371,9 +425,9 @@ bash -n scripts/*.sh
 ```
 
 当前测试覆盖：门控公式、固定奖励、零奖励死区、开关公平性、候选外 GT、非法 JSON、
-漏药、重复药、候选外药、非字符串元素、Qwen `<think>` 包装和 GT 提示词泄漏。
+漏项、重复/越界/字符串序号、Qwen `<think>` 包装、完整指标差值和 GT 提示词泄漏。
 
-## 12. 方法边界
+## 13. 方法边界
 
 - 本方法是 reranker，不能找回 GNN 未召回的中药；论文中应单独报告候选 Recall@K。
 - 候选顺序必须固定来自同一个 retriever，方法与消融不能使用不同候选集。
