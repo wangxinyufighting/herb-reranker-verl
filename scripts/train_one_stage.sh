@@ -5,7 +5,7 @@ set -euo pipefail
 # VERL_ROOT 必须指向已经安装依赖的 VERL 仓库；本工程不会修改其中任何文件。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-: "${VERL_ROOT:?请设置 VERL_ROOT，例如 VERL_ROOT=/path/to/verl}"
+VERL_ROOT="${VERL_ROOT:-/root/autodl-tmp/verl}"    
 
 TRAIN_FILES="${TRAIN_FILES:-${PROJECT_ROOT}/data/processed/train_top50.parquet}"
 VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/test_top50.parquet}"
@@ -45,7 +45,7 @@ LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 ROLLOUT_TP="${ROLLOUT_TP:-1}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.50}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-512}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 KL_COEF="${KL_COEF:-1e-3}"
@@ -56,6 +56,10 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-grpo-${REWARD_MODE_TAG}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/${EXPERIMENT_NAME}}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-20}"
+
+# 保存每一步的原始 rollout，便于排查截断、重复输出和奖励异常。
+ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-${PROJECT_ROOT}/outputs/${EXPERIMENT_NAME}/rollouts}"
+mkdir -p "${ROLLOUT_DATA_DIR}"
 
 if [[ ! -f "${TRAIN_FILES}" ]]; then
   echo "训练文件不存在: ${TRAIN_FILES}" >&2
@@ -85,8 +89,12 @@ python3 -m verl.trainer.main_ppo \
   data.filter_overlong_prompts=True \
   data.truncation=error \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
+  actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
+  actor_rollout_ref.ref.fsdp_config.model_dtype=bf16 \
+  actor_rollout_ref.rollout.dtype=bfloat16 \
   actor_rollout_ref.model.use_remove_padding=True \
-  actor_rollout_ref.model.enable_gradient_checkpointing=True \
+  +actor_rollout_ref.model.override_config.attn_implementation=sdpa\ 
+  actor_rollout_ref.model.enable_gradient_checkpointing=False \
   actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
   actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03 \
   actor_rollout_ref.rollout.free_cache_engine=True \
@@ -132,6 +140,7 @@ python3 -m verl.trainer.main_ppo \
   trainer.save_freq="${SAVE_FREQ}" \
   trainer.test_freq="${TEST_FREQ}" \
   trainer.default_local_dir="${CHECKPOINT_DIR}" \
+  trainer.rollout_data_dir="${ROLLOUT_DATA_DIR}" \
   trainer.resume_mode="${RESUME_MODE}" \
   trainer.total_epochs="${TOTAL_EPOCHS}" \
   trainer.device=cuda
