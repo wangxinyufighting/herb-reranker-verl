@@ -105,6 +105,9 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
   actor_rollout_ref.rollout.temperature=1.0 \
   actor_rollout_ref.rollout.top_p=1.0 \
+  actor_rollout_ref.rollout.val_kwargs.n=1 \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=False \
+  actor_rollout_ref.rollout.val_kwargs.temperature=0 \
   actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}" \
