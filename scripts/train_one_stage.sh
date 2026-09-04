@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${VERL_ROOT:?请设置 VERL_ROOT，例如 VERL_ROOT=/path/to/verl}"
 
-TRAIN_FILES="${TRAIN_FILES:-${PROJECT_ROOT}/data/processed/train.parquet}"
+TRAIN_FILES="${TRAIN_FILES:-${PROJECT_ROOT}/data/processed/train_top50.parquet}"
 VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/test_top50.parquet}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
 

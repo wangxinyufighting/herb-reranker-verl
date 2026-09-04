@@ -22,6 +22,8 @@ herb-reranker-verl/
 │   ├── prepare_data.py
 │   └── reward.py
 ├── scripts/
+│   ├── build_split_parquet.sh
+│   ├── build_train_parquet.sh
 │   ├── build_test_parquet.sh
 │   ├── prepare_data.sh
 │   ├── train.sh
@@ -87,6 +89,23 @@ herb_mapping.txt          中药名称与 ID 的映射
 ```bash
 bash scripts/build_test_parquet.sh
 ```
+
+训练集使用完全相同的格式。准备以下文件：
+
+```text
+data/raw/train_with_context.jsonl
+data/raw/train_top200_herbs.txt
+data/raw/herb_mapping.txt
+```
+
+然后运行：
+
+```bash
+bash scripts/build_train_parquet.sh
+```
+
+默认得到 `data/processed/train_top50.parquet`。本次只提供了 test 的 GNN 输出，因此
+训练构建代码已经就绪，但需要补充 `train_top200_herbs.txt` 后才能生成真实训练 Parquet。
 
 默认输出：
 

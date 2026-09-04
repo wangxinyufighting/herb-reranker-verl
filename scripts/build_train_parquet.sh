@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 测试集默认保留“候选与 GT 完全无交集”的病例，避免只评测召回成功的子集。
+# 训练集默认丢弃“候选与 GT 完全无交集”的病例，因为它们没有重排学习信号。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export SPLIT=test
+export SPLIT=train
 
 exec bash "${SCRIPT_DIR}/build_split_parquet.sh" "$@"
+
