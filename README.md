@@ -319,8 +319,10 @@ Precision 和 Recall 已由 reward 函数计算并返回，但默认不再叠加
 原因是固定 cutoff 下二者都主要由命中数量决定，直接与二元 NDCG 相加会重复计权并
 削弱对头部位置的敏感性。标量 reward 仍由层级 NDCG 与格式约束组成。
 
-奖励函数还返回 `gate_5/10`、`candidate_coverage`、`exact_permutation` 等指标，供
-VERL 日志记录和实验分析。
+奖励函数还返回 `gate_5/10`、`candidate_coverage`、`exact_permutation`、
+`duplicate_index_count`、`invalid_index_count` 和 `missing_index_count`，用于区分
+重复、非法和遗漏序号。旧实现中的加性 penalty 不再使用，避免人为惩罚系数改变主排序
+目标；这些错误已经通过 `q_constraint` 统一影响 reward。
 
 ## 9. 每 N 步监控测试集重排效果
 
@@ -333,13 +335,35 @@ TEST_FREQ=20 \
 bash scripts/train.sh
 ```
 
-每次验证都会在 cutoff `5/10/15/20` 上同时记录三组指标：
+每次验证都会在 cutoff `5/10/15/20` 上记录以下指标：
 
 | SwanLab 变量名 | 含义 |
 |---|---|
 | `gnn_precision_k`, `gnn_recall_k`, `gnn_ndcg_k` | GNN 原始候选顺序；训练中应保持不变 |
 | `model_precision_k`, `model_recall_k`, `model_ndcg_k` | 当前模型重排结果 |
+| `oracle_precision_k`, `oracle_recall_k`, `oracle_ndcg_k` | 固定候选集内把所有可达 GT 前置后的理论上限 |
 | `delta_precision_k`, `delta_recall_k`, `delta_ndcg_k` | `model - gnn`；大于 0 表示重排改善 |
+| `headroom_precision_k`, `headroom_recall_k`, `headroom_ndcg_k` | `oracle - gnn`；当前 retriever 留给 reranker 的提升空间 |
+| `remaining_gap_precision_k`, `remaining_gap_recall_k`, `remaining_gap_ndcg_k` | `oracle - model`；模型尚未实现的提升空间 |
+| `copy_ratio_k`, `exact_copy_k` | 前 k 个位置复制 GNN 的比例，以及是否完整复制 |
+
+同时返回 `gnn_rank_score` 和 `rank_delta=rank_score-gnn_rank_score`。相对 GNN 的值
+只用于监控：对于同一病例，GNN 分数是 GRPO 组内的常数，直接从主 reward 中相减会在
+组内标准化时抵消，因此不会带来新的优化信号。
+
+基于三个端到端均值，可以在论文中报告候选上限归一化提升：
+
+$$
+\mathrm{NormalizedGain@k}=
+\frac{\overline{M@k}-\overline{B@k}}
+{\overline{O@k}-\overline{B@k}+\epsilon},
+$$
+
+其中 $B$、$M$、$O$ 分别表示 GNN、Model 和 Oracle。应先在测试集上分别求均值再
+计算该比值，不要在单病例上计算比值后取平均，以免小 headroom 病例放大噪声。
+
+`copy_ratio_k` 仅用于判断模型是否真正改变排序，不进入 reward。GNN 原排序可能已经
+正确，因此对复制行为施加 copy penalty 会迫使模型做无意义甚至有害的交换。
 
 在当前 VERL 中它们会显示为
 `val-aux/ptm_herb_rerank/<变量名>/mean@1`。例如模型的 NDCG@10 是
@@ -429,7 +453,8 @@ bash -n scripts/*.sh
 ```
 
 当前测试覆盖：门控公式、固定奖励、零奖励死区、开关公平性、候选外 GT、非法 JSON、
-漏项、重复/越界/字符串序号、Qwen `<think>` 包装、完整指标差值和 GT 提示词泄漏。
+漏项、重复/越界/字符串序号、Qwen `<think>` 包装、Oracle 上界、GNN headroom、
+remaining gap、复制诊断、完整指标差值和 GT 提示词泄漏。
 
 ## 13. 方法边界
 
