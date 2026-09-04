@@ -9,6 +9,7 @@ TRAIN_JSONL="${TRAIN_JSONL:-${PROJECT_ROOT}/data/train.jsonl}"
 TEST_JSONL="${TEST_JSONL:-${PROJECT_ROOT}/data/test.jsonl}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/data/processed}"
 MIN_CANDIDATES="${MIN_CANDIDATES:-20}"
+OUTPUT_K="${OUTPUT_K:-20}"
 UNREACHABLE_POLICY="${UNREACHABLE_POLICY:-drop}"
 
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -17,11 +18,12 @@ python3 -m herb_reranker.prepare_data \
   --input "${TRAIN_JSONL}" \
   --output "${OUTPUT_DIR}/train.parquet" \
   --min-candidates "${MIN_CANDIDATES}" \
+  --output-k "${OUTPUT_K}" \
   --unreachable-policy "${UNREACHABLE_POLICY}"
 
 python3 -m herb_reranker.prepare_data \
   --input "${TEST_JSONL}" \
   --output "${OUTPUT_DIR}/test.parquet" \
   --min-candidates "${MIN_CANDIDATES}" \
+  --output-k "${OUTPUT_K}" \
   --unreachable-policy "${UNREACHABLE_POLICY}"
-

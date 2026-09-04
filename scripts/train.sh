@@ -11,6 +11,7 @@ set -euo pipefail
 #   HIERARCHICAL_REWARD=off bash scripts/train.sh
 #
 # 两种模式除此之外使用完全相同的训练配置，适合直接进行消融实验。
+# 默认使用新的实验名且 RESUME_MODE=disable，避免误载旧版完整排列 checkpoint。
 # ================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

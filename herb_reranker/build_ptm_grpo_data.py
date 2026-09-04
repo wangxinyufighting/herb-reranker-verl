@@ -242,6 +242,12 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         help="候选集与 GT 无交集时：丢弃、保留或报错",
     )
+    parser.add_argument(
+        "--output-k",
+        type=int,
+        default=20,
+        help="模型需要输出的候选数量；默认 20",
+    )
     return parser.parse_args()
 
 
@@ -264,9 +270,9 @@ def main() -> None:
         output_path=args.output_parquet,
         min_candidates=args.candidate_k,
         unreachable_policy="keep",
+        output_k=args.output_k,
     )
 
 
 if __name__ == "__main__":
     main()
-

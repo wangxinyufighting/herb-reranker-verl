@@ -88,6 +88,29 @@ def fixed_joint_rank_reward(
     return sum(weight * score for weight, score in zip(weights, scores)) / normalizer
 
 
+def relative_improvement_reward(
+    model_score: float,
+    baseline_score: float,
+    epsilon: float = 1e-6,
+) -> float:
+    """把相对 GNN 的改进按当前病例的可用空间归一化到 ``[-1, 1]``。
+
+    复制 GNN 固定得到 0；提升得到正值；退化得到负值。正向分母是理论上限与
+    baseline 的距离，负向分母是 baseline 与 0 的距离，因此不同难度病例的奖励
+    尺度更接近。该设计保留质量次序，不会像直接 copy penalty 那样奖励无意义打乱。
+    """
+
+    model = _clip(float(model_score))
+    baseline = _clip(float(baseline_score))
+    delta = model - baseline
+    eps = max(float(epsilon), 1e-12)
+    if delta >= 0.0:
+        normalized = delta / max(1.0 - baseline, eps)
+    else:
+        normalized = delta / max(baseline, eps)
+    return max(-1.0, min(1.0, normalized))
+
+
 def _string_list(value: Any) -> list[str]:
     """把列表型字段规范化为去除首尾空白的字符串列表。
 
@@ -270,6 +293,8 @@ def compute_score(
     - ``fixed_weight_5/10/20``：关闭门控后的固定联合权重；
     - ``rank_weight``：排序项权重，默认 0.95；
     - ``format_weight``：格式项权重，默认 0.05。
+    - ``anti_copy_bonus_weight``：只放大真实改进且非复制的奖励，默认 0.05；
+    - ``relative_epsilon``：相对提升归一化的数值稳定项，默认 1e-6。
 
     ``data_source`` 目前不参与计算，但必须保留在签名中供 VERL 调用。
     """
@@ -277,12 +302,27 @@ def compute_score(
     del data_source  # 明确说明该参数仅用于满足 VERL 接口。
     info = extra_info if isinstance(extra_info, Mapping) else {}
     candidates = _string_list(info.get("candidate_herbs", []))
+    gnn_candidates = _string_list(info.get("gnn_candidate_herbs", []))
     targets = _extract_ground_truth(ground_truth)
 
-    # 数据预处理会保证候选唯一；这里再次去重是为了让在线训练面对脏数据时保持稳定。
+    # candidates 按输出 ID 排列；gnn_candidates 保留召回器原顺序。旧数据没有后者时
+    # 自动回退，保证 reward 仍可解析，但新版训练必须重建 Parquet 才能消除序号捷径。
     candidates = list(dict.fromkeys(candidates))
     candidate_set = set(candidates)
+    gnn_candidates = list(dict.fromkeys(gnn_candidates))
+    if len(gnn_candidates) != len(candidates) or set(gnn_candidates) != candidate_set:
+        gnn_candidates = candidates
     relevant = set(targets) & candidate_set
+
+    candidate_count = len(candidates)
+    default_output_k = min(20, candidate_count)
+    raw_output_k = info.get("output_k", default_output_k)
+    try:
+        output_k = int(raw_output_k)
+    except (TypeError, ValueError):
+        output_k = default_output_k
+    if isinstance(raw_output_k, bool) or output_k <= 0 or output_k > candidate_count:
+        output_k = default_output_k
 
     raw_ranking, json_ok, list_ok = _extract_json_ranking(solution_str)
     raw_output_count = len(raw_ranking)
@@ -290,12 +330,22 @@ def compute_score(
         raw_ranking, candidates
     )
 
-    candidate_count = len(candidates)
     # 分母使用原始数组长度，使重复、越界、字符串和空值都受到惩罚，不能在过滤后“消失”。
     candidate_precision = len(valid_unique) / max(raw_output_count, 1)
     candidate_coverage = len(valid_unique) / candidate_count if candidate_count else 0.0
-    constraint_quality = candidate_precision * candidate_coverage
+    required_output_coverage = (
+        min(len(valid_unique), output_k) / output_k if output_k else 0.0
+    )
+    constraint_quality = candidate_precision * required_output_coverage
 
+    exact_topk = float(
+        bool(candidates)
+        and list_ok == 1.0
+        and raw_output_count == output_k
+        and len(valid_unique) == output_k
+    )
+
+    # 仅保留该字段供旧面板兼容；Top-20 协议下不再要求完整候选排列。
     exact_permutation = float(
         bool(candidates)
         and list_ok == 1.0
@@ -327,8 +377,8 @@ def compute_score(
     }
 
     # Oracle 只能重排当前候选，不能引入候选外 GT。它给出固定 retriever 下的理论上限。
-    oracle_ranking = [herb for herb in candidates if herb in relevant]
-    oracle_ranking.extend(herb for herb in candidates if herb not in relevant)
+    oracle_ranking = [herb for herb in gnn_candidates if herb in relevant]
+    oracle_ranking.extend(herb for herb in gnn_candidates if herb not in relevant)
     oracle_precision = {
         cutoff: _precision_at_k(oracle_ranking, relevant, cutoff)
         for cutoff in cutoffs
@@ -345,19 +395,19 @@ def compute_score(
     # GNN 原始候选顺序是不经过训练的 test baseline。验证时返回其指标，SwanLab
     # 会与模型指标一起按测试集求均值，因此无需修改 VERL 或额外跑一遍评测脚本。
     gnn_precision = {
-        cutoff: _precision_at_k(candidates, relevant, cutoff)
+        cutoff: _precision_at_k(gnn_candidates, relevant, cutoff)
         for cutoff in cutoffs
     }
     gnn_recall = {
-        cutoff: _recall_at_k(candidates, target_set, cutoff)
+        cutoff: _recall_at_k(gnn_candidates, target_set, cutoff)
         for cutoff in cutoffs
     }
     gnn_ndcg = {
-        cutoff: _ndcg_at_k(candidates, target_set, cutoff)
+        cutoff: _ndcg_at_k(gnn_candidates, target_set, cutoff)
         for cutoff in cutoffs
     }
     gnn_reward_ndcg = {
-        cutoff: _ndcg_at_k(candidates, relevant, cutoff)
+        cutoff: _ndcg_at_k(gnn_candidates, relevant, cutoff)
         for cutoff in cutoffs
     }
     use_hierarchical = _as_bool(kwargs.get("use_hierarchical_reward", True))
@@ -396,12 +446,19 @@ def compute_score(
             weight_20=float(kwargs.get("fixed_weight_20", 0.3)),
         )
 
-    # 采用分级格式奖励，避免训练早期所有输出都不合法而导致组内奖励完全相同。
+    # 采用分级格式分数诊断不同错误。只有严格满足 Top-K 协议的输出才获得任务奖励；
+    # 非法输出统一落在合法输出的理论下界以下，避免残缺答案胜过合法但较差的排序。
+    length_score = (
+        max(0.0, 1.0 - abs(raw_output_count - output_k) / output_k)
+        if output_k
+        else 0.0
+    )
     format_score = (
-        0.20 * json_ok
-        + 0.20 * list_ok
-        + 0.30 * candidate_precision
-        + 0.30 * candidate_coverage
+        0.15 * json_ok
+        + 0.15 * list_ok
+        + 0.25 * candidate_precision
+        + 0.25 * required_output_coverage
+        + 0.20 * length_score
     )
 
     rank_weight = _clip(float(kwargs.get("rank_weight", 0.95)))
@@ -412,16 +469,46 @@ def compute_score(
     rank_weight /= normalizer
     format_weight /= normalizer
 
-    total_score = rank_weight * rank_score * constraint_quality + format_weight * format_score
+    relative_epsilon = max(float(kwargs.get("relative_epsilon", 1e-6)), 1e-12)
+    relative_improvement = relative_improvement_reward(
+        model_score=rank_score,
+        baseline_score=gnn_rank_score,
+        epsilon=relative_epsilon,
+    )
+    copy_ratio_output = _copy_ratio_at_k(
+        model_ranking, gnn_candidates, output_k
+    )
+    anti_copy_bonus_weight = _clip(
+        float(kwargs.get("anti_copy_bonus_weight", 0.05))
+    )
+    # 只放大“已经优于 GNN 且确实改变位置”的输出。退化排序不会因为不同而获奖。
+    anti_copy_bonus = (
+        anti_copy_bonus_weight
+        * max(relative_improvement, 0.0)
+        * (1.0 - copy_ratio_output)
+    )
+
+    if exact_topk == 1.0:
+        total_score = (
+            rank_weight * relative_improvement
+            + format_weight * format_score
+            + anti_copy_bonus
+        )
+        total_score = max(-1.0, min(1.0, total_score))
+    else:
+        # 合法输出最低为 -rank_weight+format_weight；非法输出最高约为 -0.975。
+        # 分级 format_score 仍能在训练初期区分完全不可解析与接近合法的答案。
+        total_score = -1.0 + 0.5 * format_weight * format_score
 
     # score 是 VERL 使用的主奖励。Precision/Recall 只作为 reward extra metrics
     # 监控，不直接叠加到标量奖励，避免与二元 NDCG 中的命中数重复计权。
     metrics = {
         "score": float(total_score),
         "rank_score": float(rank_score),
-        # 相对基线只用于解释；GRPO 组内归一化会抵消同一病例的常数基线。
         "gnn_rank_score": float(gnn_rank_score),
         "rank_delta": float(rank_score - gnn_rank_score),
+        "relative_improvement": float(relative_improvement),
+        "anti_copy_bonus": float(anti_copy_bonus),
         # 保留旧键名，避免已有 SwanLab 面板和分析脚本失效。
         "ndcg_5": float(reward_ndcg[5]),
         "ndcg_10": float(reward_ndcg[10]),
@@ -433,18 +520,26 @@ def compute_score(
         "format_score": float(format_score),
         "candidate_precision": float(candidate_precision),
         "candidate_coverage": float(candidate_coverage),
+        "required_output_coverage": float(required_output_coverage),
         "constraint_quality": float(constraint_quality),
+        "length_score": float(length_score),
+        "output_k": float(output_k),
+        "valid_output": float(exact_topk),
+        "exact_topk": float(exact_topk),
         "exact_permutation": float(exact_permutation),
         "reachable_gt_count": float(len(relevant)),
         "duplicate_index_count": float(index_diagnostics["duplicate_index_count"]),
         "invalid_index_count": float(index_diagnostics["invalid_index_count"]),
-        "missing_index_count": float(index_diagnostics["missing_index_count"]),
+        "missing_index_count": float(max(0, output_k - len(valid_unique))),
+        "extra_index_count": float(max(0, raw_output_count - output_k)),
+        "unranked_candidate_count": float(max(0, candidate_count - len(valid_unique))),
+        "copy_ratio_output": float(copy_ratio_output),
     }
     for cutoff in cutoffs:
-        copy_ratio = _copy_ratio_at_k(model_ranking, candidates, cutoff)
+        copy_ratio = _copy_ratio_at_k(model_ranking, gnn_candidates, cutoff)
         metrics[f"copy_ratio_{cutoff}"] = copy_ratio
         metrics[f"exact_copy_{cutoff}"] = float(
-            exact_permutation == 1.0 and copy_ratio == 1.0
+            exact_topk == 1.0 and copy_ratio == 1.0
         )
 
         for metric_name, model_values, gnn_values, oracle_values in (

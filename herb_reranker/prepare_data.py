@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 
-SYSTEM_PROMPT = """你是一个中药候选重排器。请依据规范症状、原始症状描述和 GNN 候选列表，输出候选序号的新顺序。
+SYSTEM_PROMPT = """你是一个中药候选重排器。请依据规范症状、原始症状描述和 GNN 候选列表，输出最相关候选的序号排序。
 必须遵守以下规则：
 1. ranking 中只能输出整数序号，不得输出药名；
-2. 每个候选序号必须且只能出现一次；
-3. 不得增加、删除或重复序号；
+2. 输出数量必须等于用户指定的 Top-K；
+3. 序号必须来自候选列表，且不得重复；
 4. 越相关的中药排得越靠前；
 5. 只输出一行合法 JSON，不要解释。"""
 
@@ -31,29 +32,64 @@ def _require_string_list(record: dict[str, Any], field: str, line_no: int) -> li
     return cleaned
 
 
+def _candidate_id_view(
+    sample_id: str, gnn_candidates: list[str]
+) -> tuple[list[str], list[tuple[int, int, str]]]:
+    """为候选分配可复现的非顺序 ID，消除 ``[1,2,...]`` 复制捷径。
+
+    候选行仍按 GNN 名次展示，因此原始召回顺序没有丢失；只是输出 ID 与名次不再
+    相同。排序由 SHA-256 决定，不依赖 Python 的随机种子或进程状态，同一病例在
+    train/validation/inference 中始终得到相同 ID。
+
+    返回：按 ID 索引的候选表，以及按 GNN 名次展示的 ``(ID, 名次, 药名)``。
+    """
+
+    candidate_count = len(gnn_candidates)
+    candidate_ids = list(range(1, candidate_count + 1))
+    candidate_ids.sort(
+        key=lambda candidate_id: hashlib.sha256(
+            f"{sample_id}:{candidate_id}".encode("utf-8")
+        ).digest()
+    )
+
+    candidates_by_id = [""] * candidate_count
+    display_rows: list[tuple[int, int, str]] = []
+    for gnn_rank, (candidate_id, herb) in enumerate(
+        zip(candidate_ids, gnn_candidates), start=1
+    ):
+        candidates_by_id[candidate_id - 1] = herb
+        display_rows.append((candidate_id, gnn_rank, herb))
+    return candidates_by_id, display_rows
+
+
 def _build_user_prompt(
-    symptoms: list[str], symptom_description: str, candidate_herbs: list[str]
+    symptoms: list[str],
+    symptom_description: str,
+    display_rows: list[tuple[int, int, str]],
+    output_k: int,
 ) -> str:
     """构造模型输入；真实药方绝不会进入提示词。"""
 
     numbered_candidates = "\n".join(
-        f"{index}. {herb}" for index, herb in enumerate(candidate_herbs, start=1)
+        f"候选ID {candidate_id} | GNN名次 {gnn_rank} | {herb}"
+        for candidate_id, gnn_rank, herb in display_rows
     )
+    candidate_count = len(display_rows)
     return (
         "/no_think\n"
         f"规范症状：{'、'.join(symptoms)}\n"
         f"原始症状描述：{symptom_description}\n"
-        "GNN 候选中药（当前顺序仅作为召回器先验）：\n"
+        "GNN 候选中药（按 GNN 名次展示；候选ID是输出时使用的标识）：\n"
         f"{numbered_candidates}\n"
-        f"请只输出一个含 ranking 字段的 JSON 对象；ranking 必须是长度为 "
-        f"{len(candidate_herbs)} 的整数数组，并且是 1 到 {len(candidate_herbs)} "
-        "所有序号的一个完整排列。不得输出药名。\n"
-        '输出示例：{"ranking":[3,1,2,4]}（示例仅说明格式，实际必须输出全部序号）。'
+        f"请从 {candidate_count} 个候选中选出最相关的 {output_k} 个并重新排序。"
+        f"ranking 必须恰好包含 {output_k} 个互不重复的整数候选ID，"
+        f"每个ID必须在 1 到 {candidate_count} 之间。不得输出药名。\n"
+        "只输出一个含 ranking 字段的 JSON 对象；不要输出代码块、省略号或其他字段。"
     )
 
 
 def _convert_record(
-    record: dict[str, Any], line_no: int, min_candidates: int
+    record: dict[str, Any], line_no: int, min_candidates: int, output_k: int = 20
 ) -> tuple[dict[str, Any], int]:
     """检查一条原始记录并构造 VERL 样本，同时返回可达 GT 数量。"""
 
@@ -79,16 +115,23 @@ def _convert_record(
         raise ValueError(f"第 {line_no} 行 candidate_herbs 含重复中药")
     if len(set(ground_truth)) != len(ground_truth):
         raise ValueError(f"第 {line_no} 行 ground_truth_herbs 含重复中药")
+    if output_k <= 0:
+        raise ValueError("output_k 必须大于 0")
+    if output_k > len(candidates):
+        raise ValueError(
+            f"第 {line_no} 行只有 {len(candidates)} 个候选，少于 output_k={output_k}"
+        )
 
     reachable_count = len(set(candidates) & set(ground_truth))
-    prompt = _build_user_prompt(symptoms, description, candidates)
+    candidates_by_id, display_rows = _candidate_id_view(sample_id, candidates)
+    prompt = _build_user_prompt(symptoms, description, display_rows, output_k)
     converted = {
         "data_source": "ptm_herb_rerank",
         "prompt": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
         ],
-        "ability": "listwise_reranking",
+        "ability": "topk_listwise_reranking",
         "reward_model": {
             "style": "rule",
             "ground_truth": {"ground_truth_herbs": ground_truth},
@@ -97,8 +140,13 @@ def _convert_record(
             "sample_id": sample_id,
             "symptoms": symptoms,
             "symptom_description": description,
-            "candidate_herbs": candidates,
+            # candidate_herbs 按候选 ID 排列，reward 用 ranking 中的 ID 查询药名。
+            "candidate_herbs": candidates_by_id,
+            # GNN 顺序单独保存，用于计算不随 ID 编排变化的原始 baseline。
+            "gnn_candidate_herbs": candidates,
             "candidate_k": len(candidates),
+            "output_k": output_k,
+            "candidate_id_scheme": "deterministic_permuted_v1",
             "retriever": "gnn",
         },
     }
@@ -110,6 +158,7 @@ def convert_jsonl(
     output_path: Path,
     min_candidates: int,
     unreachable_policy: str,
+    output_k: int = 20,
 ) -> None:
     """转换完整文件，并按策略处理候选与 GT 无交集的病例。"""
 
@@ -128,7 +177,9 @@ def convert_jsonl(
             if not isinstance(raw, dict):
                 raise ValueError(f"第 {line_no} 行必须是 JSON 对象")
 
-            row, reachable_count = _convert_record(raw, line_no, min_candidates)
+            row, reachable_count = _convert_record(
+                raw, line_no, min_candidates, output_k=output_k
+            )
             sample_id = row["extra_info"]["sample_id"]
             if sample_id in sample_ids:
                 raise ValueError(f"sample_id 重复: {sample_id}")
@@ -175,6 +226,12 @@ def parse_args() -> argparse.Namespace:
         default="drop",
         help="候选集与 GT 无交集时：丢弃、保留或报错",
     )
+    parser.add_argument(
+        "--output-k",
+        type=int,
+        default=20,
+        help="模型必须输出的候选数量；默认 20，与最高评测 cutoff 对齐",
+    )
     return parser.parse_args()
 
 
@@ -182,11 +239,14 @@ def main() -> None:
     args = parse_args()
     if args.min_candidates <= 0:
         raise ValueError("--min-candidates 必须大于 0")
+    if args.output_k <= 0:
+        raise ValueError("--output-k 必须大于 0")
     convert_jsonl(
         input_path=args.input,
         output_path=args.output,
         min_candidates=args.min_candidates,
         unreachable_policy=args.unreachable_policy,
+        output_k=args.output_k,
     )
 
 

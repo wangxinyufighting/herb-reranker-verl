@@ -24,6 +24,7 @@ RETRIEVAL_FILE="${RETRIEVAL_FILE:-${PROJECT_ROOT}/data/raw/${SPLIT}_top200_herbs
 HERB_MAPPING="${HERB_MAPPING:-${PROJECT_ROOT}/data/raw/herb_mapping.txt}"
 OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/data/processed}"
 CANDIDATE_K="${CANDIDATE_K:-50}"
+OUTPUT_K="${OUTPUT_K:-20}"
 UNREACHABLE_POLICY="${UNREACHABLE_POLICY:-${DEFAULT_UNREACHABLE_POLICY}}"
 
 export PYTHONPATH="${PROJECT_ROOT}:${PYTHONPATH:-}"
@@ -35,5 +36,5 @@ python3 -m herb_reranker.build_ptm_grpo_data \
   --output-jsonl "${OUTPUT_DIR}/${SPLIT}_top${CANDIDATE_K}.jsonl" \
   --output-parquet "${OUTPUT_DIR}/${SPLIT}_top${CANDIDATE_K}.parquet" \
   --candidate-k "${CANDIDATE_K}" \
+  --output-k "${OUTPUT_K}" \
   --unreachable-policy "${UNREACHABLE_POLICY}"
-

@@ -1,7 +1,8 @@
 # Herb Reranker with VERL/GRPO
 
 一个不修改 VERL 源码的中药候选重排工程。模型读取症状列表、原始症状描述和
-GNN Top-K 候选中药，输出候选全集的新排序。
+GNN Top-K 候选中药，从候选中输出固定 Top-20 排序。奖励以 GNN 为零基线：复制为
+0、改善为正、退化为负，避免模型通过原样复述召回结果获得高分。
 
 当前实现支持两种严格可比的排序奖励：
 
@@ -21,7 +22,8 @@ herb-reranker-verl/
 │   ├── build_ptm_grpo_data.py
 │   ├── filter_train_by_test.py
 │   ├── prepare_data.py
-│   └── reward.py
+│   ├── reward.py
+│   └── validate_parquet.py
 ├── scripts/
 │   ├── build_split_parquet.sh
 │   ├── build_train_parquet.sh
@@ -52,9 +54,15 @@ herb-reranker-verl/
 {"ranking":[3,1,2,4]}
 ```
 
-序号采用 1-based 编号，`1` 对应候选列表中的第 1 味药。输出必须是 `1..K` 的完整
-排列，不能增加、删除、重复序号，也不能直接输出药名。因此本方法不进行处方长度预测，
-也不包含 length reward。序号协议显著缩短输出，并避免长药名引发的重复和截断错误。
+序号采用 1-based 候选 ID。默认从 50 个候选中输出恰好 20 个互不重复的 ID；它们
+决定论文所需的全部 `@5/10/15/20` 指标，未输出的尾部候选不参与训练。需要完整排序时，
+可以在推理后把剩余候选按原 GNN 顺序补到尾部。这是固定 Top-20 reranking，不是处方
+长度预测，也不包含 length reward。
+
+候选 ID 使用由 `sample_id` 决定的可复现置换，不等于 GNN 名次。提示词会同时展示
+“候选ID”和“GNN名次”。这样 `[1,2,...,20]` 不再天然等于复制 GNN；模型若要保留
+GNN 顺序，也必须读取候选内容和名次。原始 GNN 顺序单独存入 `gnn_candidate_herbs`，
+因此 baseline 评测不会受到 ID 置换影响。
 
 ## 3. 原始数据格式
 
@@ -121,6 +129,14 @@ data/processed/test_top50.parquet
 
 ```bash
 CANDIDATE_K=200 bash scripts/build_test_parquet.sh
+```
+
+默认输出固定 Top-20；如需做输出规模消融，可以显式设置 `OUTPUT_K`，但同一组实验的
+训练、验证和测试必须保持一致：
+
+```bash
+OUTPUT_K=20 bash scripts/build_train_parquet.sh
+OUTPUT_K=20 bash scripts/build_test_parquet.sh
 ```
 
 序号输出下，Top-50 建议从 `MAX_RESPONSE_LENGTH=256` 开始，Top-200 建议从 1024
@@ -203,16 +219,19 @@ FILTER_MODE=exact bash scripts/filter_train_by_test.sh
         "sample_id": "...",
         "symptoms": [...],
         "symptom_description": "...",
-        "candidate_herbs": [...],
+        "candidate_herbs": [...],       # 按候选ID索引的顺序
+        "gnn_candidate_herbs": [...],   # GNN原始顺序
         "candidate_k": 50,
+        "output_k": 20,
+        "candidate_id_scheme": "deterministic_permuted_v1",
         "retriever": "gnn",
     },
 }
 ```
 
-提示词会直接写入 Parquet。若从旧版“输出药名”协议升级到当前“输出序号”协议，必须
-重新构建 train/test Parquet；若还使用测试相关训练子集，也要在重建后重新执行筛选。
-旧 checkpoint 已学习药名输出协议，不应恢复到新实验中。
+提示词会直接写入 Parquet。若从旧版“输出药名”或“完整输出50个连续序号”协议升级，
+必须重新构建 train/test Parquet；若还使用测试相关训练子集，也要在重建后重新执行
+筛选。旧 checkpoint 与新的候选 ID 和 Top-20 协议不兼容，不能恢复到新实验中。
 
 ## 5. 评测指标
 
@@ -303,26 +322,42 @@ $$
 
 ## 8. 完整奖励
 
-两种模式共用相同的约束和格式奖励：
+先分别计算模型与原始 GNN 的层级（或固定联合）排序分数 $S_M,S_B\in[0,1]$，
+再把相对改善按当前病例的可用空间归一化：
 
 $$
-r=0.95\,r_{\mathrm{rank}}q_{\mathrm{constraint}}
-+0.05\,r_{\mathrm{format}}.
+R_{\mathrm{imp}}=
+\begin{cases}
+\dfrac{S_M-S_B}{1-S_B+\epsilon}, & S_M\ge S_B,\\
+\dfrac{S_M-S_B}{S_B+\epsilon}, & S_M<S_B.
+\end{cases}
 $$
 
-- `q_constraint` 同时考虑候选合法率和候选覆盖率；
-- `r_format` 提供很小的稠密格式反馈；
-- 漏项、重复项、非整数或越界序号都会降低奖励；
-- 完整合法且排序理想时，总奖励为 1。
+因此复制 GNN 固定为 0，改善为正，退化为负。额外的安全防复制奖励为：
+
+$$
+R_{\mathrm{ac}}=\lambda\max(R_{\mathrm{imp}},0)
+\left(1-\mathrm{CopyRatio@20}\right).
+$$
+
+它只放大“已经改善且确实改变位置”的结果；更差的随机排序不会因为与 GNN 不同而
+获得奖励。合法输出的总奖励为：
+
+$$
+R=0.95R_{\mathrm{imp}}+0.05R_{\mathrm{format}}+R_{\mathrm{ac}}.
+$$
+
+输出必须恰好包含 `output_k=20` 个不同的合法整数 ID。非法 JSON、数量错误、重复、
+非整数或越界输出不会获得排序奖励，其分数被放在所有合法输出的理论下界以下；分级
+格式分数只用于区分训练早期不同程度的格式错误。
 
 Precision 和 Recall 已由 reward 函数计算并返回，但默认不再叠加进标量 reward。
 原因是固定 cutoff 下二者都主要由命中数量决定，直接与二元 NDCG 相加会重复计权并
 削弱对头部位置的敏感性。标量 reward 仍由层级 NDCG 与格式约束组成。
 
-奖励函数还返回 `gate_5/10`、`candidate_coverage`、`exact_permutation`、
-`duplicate_index_count`、`invalid_index_count` 和 `missing_index_count`，用于区分
-重复、非法和遗漏序号。旧实现中的加性 penalty 不再使用，避免人为惩罚系数改变主排序
-目标；这些错误已经通过 `q_constraint` 统一影响 reward。
+奖励函数还返回 `relative_improvement`、`anti_copy_bonus`、`valid_output`、
+`exact_topk`、`copy_ratio_output`、`duplicate_index_count`、`invalid_index_count`、
+`missing_index_count` 和 `extra_index_count`，便于直接定位退化或协议错误。
 
 ## 9. 每 N 步监控测试集重排效果
 
@@ -347,9 +382,9 @@ bash scripts/train.sh
 | `remaining_gap_precision_k`, `remaining_gap_recall_k`, `remaining_gap_ndcg_k` | `oracle - model`；模型尚未实现的提升空间 |
 | `copy_ratio_k`, `exact_copy_k` | 前 k 个位置复制 GNN 的比例，以及是否完整复制 |
 
-同时返回 `gnn_rank_score` 和 `rank_delta=rank_score-gnn_rank_score`。相对 GNN 的值
-只用于监控：对于同一病例，GNN 分数是 GRPO 组内的常数，直接从主 reward 中相减会在
-组内标准化时抵消，因此不会带来新的优化信号。
+同时返回 `gnn_rank_score`、`rank_delta=rank_score-gnn_rank_score` 和归一化后的
+`relative_improvement`。主 reward 使用相对值来统一不同难度病例的尺度，并让复制行为
+在监控中明确对应 0；真正的 GRPO 学习信号仍来自同一病例多个 rollout 之间的质量差异。
 
 基于三个端到端均值，可以在论文中报告候选上限归一化提升：
 
@@ -362,8 +397,8 @@ $$
 其中 $B$、$M$、$O$ 分别表示 GNN、Model 和 Oracle。应先在测试集上分别求均值再
 计算该比值，不要在单病例上计算比值后取平均，以免小 headroom 病例放大噪声。
 
-`copy_ratio_k` 仅用于判断模型是否真正改变排序，不进入 reward。GNN 原排序可能已经
-正确，因此对复制行为施加 copy penalty 会迫使模型做无意义甚至有害的交换。
+`copy_ratio_k` 本身不作为负向 penalty。它只在模型已经优于 GNN 时调节一个很小的
+正向 bonus，从而避免迫使本来已经正确的 GNN 排序做无意义交换。
 
 在当前 VERL 中它们会显示为
 `val-aux/ptm_herb_rerank/<变量名>/mean@1`。例如模型的 NDCG@10 是
@@ -394,6 +429,12 @@ bash scripts/prepare_data.sh
 
 ## 11. 启动训练
 
+首次使用本版本前必须重新构建 Parquet。训练入口会逐条检查 `candidate_id_scheme`、
+`output_k`、GNN 原顺序和 Prompt 版本；若误用了旧 Parquet，会在启动 Ray 前直接报错。
+训练脚本默认 `RESUME_MODE=disable`，实验名中
+包含 `top20-relative-v2`，用于隔离旧的药名/完整排列 checkpoint。只有继续同一协议的
+中断任务时，才显式设置 `RESUME_MODE=auto`。
+
 ### 11.1 开启能力门控：本文方法
 
 ```bash
@@ -415,8 +456,8 @@ bash scripts/train.sh
 两个模式默认分别写入：
 
 ```text
-checkpoints/Qwen3-0.6B-grpo-hierarchical/
-checkpoints/Qwen3-0.6B-grpo-fixed/
+checkpoints/Qwen3-0.6B-top20-relative-v2-hierarchical/
+checkpoints/Qwen3-0.6B-top20-relative-v2-fixed/
 ```
 
 避免两个实验错误地恢复彼此的 checkpoint。
@@ -427,8 +468,13 @@ checkpoints/Qwen3-0.6B-grpo-fixed/
 VERL_ROOT=/path/to/verl \
 MODEL_PATH=Qwen/Qwen3-1.7B \
 HIERARCHICAL_REWARD=on \
+RESUME_MODE=disable \
 bash scripts/train.sh
 ```
+
+训练默认使用 `ROLLOUT_N=8`、`ROLLOUT_TEMPERATURE=1.2`、`ROLLOUT_TOP_P=0.95` 和
+`ENTROPY_COEFF=0.005` 保留探索。若新运行的同一病例仍产生完全相同的8条输出，应先做
+短程 Top-20 SFT warm-up，而不是继续提高 copy penalty。
 
 ### 11.4 单卡显存不足
 
@@ -452,9 +498,9 @@ python3 -m unittest discover -s tests -v
 bash -n scripts/*.sh
 ```
 
-当前测试覆盖：门控公式、固定奖励、零奖励死区、开关公平性、候选外 GT、非法 JSON、
-漏项、重复/越界/字符串序号、Qwen `<think>` 包装、Oracle 上界、GNN headroom、
-remaining gap、复制诊断、完整指标差值和 GT 提示词泄漏。
+当前测试覆盖：门控公式、固定奖励、相对改善归一化、复制零基线、安全防复制 bonus、
+固定 Top-20、候选 ID 置换、非法 JSON、漏项、重复/越界/字符串序号、Qwen `<think>`
+包装、Oracle 上界、GNN headroom、remaining gap、完整指标差值和 GT 提示词泄漏。
 
 ## 13. 方法边界
 

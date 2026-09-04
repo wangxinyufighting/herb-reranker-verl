@@ -5,7 +5,7 @@ set -euo pipefail
 # VERL_ROOT 必须指向已经安装依赖的 VERL 仓库；本工程不会修改其中任何文件。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-VERL_ROOT="${VERL_ROOT:-/root/autodl-tmp/verl}"    
+: "${VERL_ROOT:?请设置 VERL_ROOT，例如 VERL_ROOT=/path/to/verl}"
 
 TRAIN_FILES="${TRAIN_FILES:-${PROJECT_ROOT}/data/processed/train_top50.parquet}"
 VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/test_top50.parquet}"
@@ -34,7 +34,8 @@ FIXED_WEIGHT_10="${FIXED_WEIGHT_10:-0.3}"
 FIXED_WEIGHT_20="${FIXED_WEIGHT_20:-0.3}"
 
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
-RESUME_MODE="${RESUME_MODE:-auto}"
+# 新的 Top-20/相对奖励协议与旧 checkpoint 不兼容，默认禁止自动恢复。
+RESUME_MODE="${RESUME_MODE:-disable}"
 
 # 单卡 0.6B/1.7B 的保守默认值；可按显存和 GPU 数量通过环境变量覆盖。
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-1}"
@@ -44,20 +45,24 @@ PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 ROLLOUT_TP="${ROLLOUT_TP:-1}"
+OUTPUT_K="${OUTPUT_K:-20}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.50}"
-MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-1024}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-512}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 KL_COEF="${KL_COEF:-1e-3}"
+ENTROPY_COEFF="${ENTROPY_COEFF:-0.005}"
+ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.2}"
+ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.95}"
+ANTI_COPY_BONUS_WEIGHT="${ANTI_COPY_BONUS_WEIGHT:-0.05}"
+RELATIVE_EPSILON="${RELATIVE_EPSILON:-1e-6}"
 
 PROJECT_NAME="${PROJECT_NAME:-herb-reranker}"
 MODEL_NAME="${MODEL_PATH##*/}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-grpo-${REWARD_MODE_TAG}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-top20-relative-v2-${REWARD_MODE_TAG}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/${EXPERIMENT_NAME}}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-20}"
-
-# 保存每一步的原始 rollout，便于排查截断、重复输出和奖励异常。
 ROLLOUT_DATA_DIR="${ROLLOUT_DATA_DIR:-${PROJECT_ROOT}/outputs/${EXPERIMENT_NAME}/rollouts}"
 mkdir -p "${ROLLOUT_DATA_DIR}"
 
@@ -76,6 +81,12 @@ fi
 
 # 通过 PYTHONPATH 引用外部仓库，不复制也不修改 VERL 源码。
 export PYTHONPATH="${PROJECT_ROOT}:${VERL_ROOT}:${PYTHONPATH:-}"
+
+# 防止旧版“完整输出50项”Parquet 与新版 Top-20 reward 静默混用。
+python3 -m herb_reranker.validate_parquet \
+  --files "${TRAIN_FILES}" "${VAL_FILES}" \
+  --expected-output-k "${OUTPUT_K}"
+
 cd "${VERL_ROOT}"
 
 python3 -m verl.trainer.main_ppo \
@@ -89,12 +100,8 @@ python3 -m verl.trainer.main_ppo \
   data.filter_overlong_prompts=True \
   data.truncation=error \
   actor_rollout_ref.model.path="${MODEL_PATH}" \
-  actor_rollout_ref.actor.fsdp_config.model_dtype=bf16 \
-  actor_rollout_ref.ref.fsdp_config.model_dtype=bf16 \
-  actor_rollout_ref.rollout.dtype=bfloat16 \
   actor_rollout_ref.model.use_remove_padding=True \
-  +actor_rollout_ref.model.override_config.attn_implementation=sdpa\ 
-  actor_rollout_ref.model.enable_gradient_checkpointing=False \
+  actor_rollout_ref.model.enable_gradient_checkpointing=True \
   actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
   actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0.03 \
   actor_rollout_ref.rollout.free_cache_engine=True \
@@ -103,7 +110,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.use_kl_loss=True \
   actor_rollout_ref.actor.kl_loss_coef="${KL_COEF}" \
   actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-  actor_rollout_ref.actor.entropy_coeff=0 \
+  actor_rollout_ref.actor.entropy_coeff="${ENTROPY_COEFF}" \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
@@ -111,8 +118,8 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
   actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
-  actor_rollout_ref.rollout.temperature=1.0 \
-  actor_rollout_ref.rollout.top_p=1.0 \
+  actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE}" \
+  actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P}" \
   actor_rollout_ref.rollout.val_kwargs.n=1 \
   actor_rollout_ref.rollout.val_kwargs.do_sample=False \
   actor_rollout_ref.rollout.val_kwargs.temperature=0 \
@@ -131,6 +138,8 @@ python3 -m verl.trainer.main_ppo \
   +reward.custom_reward_function.reward_kwargs.fixed_weight_20="${FIXED_WEIGHT_20}" \
   +reward.custom_reward_function.reward_kwargs.rank_weight=0.95 \
   +reward.custom_reward_function.reward_kwargs.format_weight=0.05 \
+  +reward.custom_reward_function.reward_kwargs.anti_copy_bonus_weight="${ANTI_COPY_BONUS_WEIGHT}" \
+  +reward.custom_reward_function.reward_kwargs.relative_epsilon="${RELATIVE_EPSILON}" \
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.logger="['console', 'swanlab']" \
