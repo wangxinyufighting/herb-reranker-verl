@@ -143,11 +143,14 @@ def convert_jsonl(
     if not rows:
         raise ValueError("转换后没有可写入的样本")
 
-    # 延迟导入，使奖励单元测试不必安装 datasets/pyarrow。
-    from datasets import Dataset
+    # 直接使用 PyArrow，避免 datasets 为内存表生成指纹时引入额外序列化依赖。
+    # VERL 最终读取的仍是完全标准的 Parquet，数据结构没有变化。
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    Dataset.from_list(rows).to_parquet(str(output_path))
+    table = pa.Table.from_pylist(rows)
+    pq.write_table(table, str(output_path), compression="snappy")
     print(
         f"已写入 {len(rows)} 条样本到 {output_path}；"
         f"无可达 GT 而丢弃 {dropped} 条。"

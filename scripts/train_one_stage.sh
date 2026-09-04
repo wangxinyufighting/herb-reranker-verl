@@ -8,7 +8,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 : "${VERL_ROOT:?请设置 VERL_ROOT，例如 VERL_ROOT=/path/to/verl}"
 
 TRAIN_FILES="${TRAIN_FILES:-${PROJECT_ROOT}/data/processed/train.parquet}"
-VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/test.parquet}"
+VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/test_top50.parquet}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
 
 # 奖励开关：on 为能力门控层级奖励，off 为固定联合 NDCG 消融基线。

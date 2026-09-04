@@ -18,9 +18,11 @@ herb-reranker-verl/
 │   ├── train.example.jsonl
 │   └── test.example.jsonl
 ├── herb_reranker/
+│   ├── build_ptm_grpo_data.py
 │   ├── prepare_data.py
 │   └── reward.py
 ├── scripts/
+│   ├── build_test_parquet.sh
 │   ├── prepare_data.sh
 │   ├── train.sh
 │   └── train_one_stage.sh
@@ -68,7 +70,50 @@ herb-reranker-verl/
 - `candidate_herbs` 保留 GNN 原始顺序，元素必须唯一；
 - `ground_truth_herbs` 仅用于奖励和评测，不会进入模型提示词；
 - `symptom_description` 必须来自诊疗时可获得的信息，不能根据真实药方反推；
-- 默认丢弃候选集与 GT 完全无交集的样本，因为它们不包含可学习的重排信号。
+- 训练集可丢弃候选集与 GT 完全无交集的样本；验证/测试集应保留，以免评测偏高。
+
+### 3.1 合并 PTM 上下文与 GNN Top-200
+
+`build_ptm_grpo_data.py` 读取三份文件：
+
+```text
+test_with_context.jsonl   症状列表、原始症状文本、GT 药方、症状 ID
+test_top200_herbs.txt      GNN 输出：症状 ID + 200 个有序中药 ID
+herb_mapping.txt          中药名称与 ID 的映射
+```
+
+建议将三份文件放到 `data/raw/`，然后执行：
+
+```bash
+bash scripts/build_test_parquet.sh
+```
+
+默认输出：
+
+```text
+data/processed/test_top50.jsonl
+data/processed/test_top50.parquet
+```
+
+脚本默认从 Top-200 中截取前 50 味作为待重排候选。使用全部 200 味时：
+
+```bash
+CANDIDATE_K=200 bash scripts/build_test_parquet.sh
+```
+
+重排 200 味时，应同步设置 `MAX_RESPONSE_LENGTH=2048`。当前测试源数据中，
+Top-50/100/200 的 GT micro recall 分别约为 0.6754、0.8204 和 0.9274。
+
+对齐过程会强制检查：
+
+- 两个文件的有效样本数完全一致；
+- 每一行的症状 ID 完全一致；
+- 所有候选中药 ID 均能映射到药名；
+- 同一病例的候选 ID 不重复；
+- 症状、文本和 GT 字段完整。
+
+测试脚本默认保留候选集与 GT 无交集的病例，避免评测偏高。构建训练集时应使用同一个
+Python 模块并设置 `--unreachable-policy drop`，因为此类训练样本没有排序学习信号。
 
 ## 4. VERL Parquet 格式
 
