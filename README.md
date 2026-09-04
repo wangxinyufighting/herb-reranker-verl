@@ -19,12 +19,14 @@ herb-reranker-verl/
 │   └── test.example.jsonl
 ├── herb_reranker/
 │   ├── build_ptm_grpo_data.py
+│   ├── filter_train_by_test.py
 │   ├── prepare_data.py
 │   └── reward.py
 ├── scripts/
 │   ├── build_split_parquet.sh
 │   ├── build_train_parquet.sh
 │   ├── build_test_parquet.sh
+│   ├── filter_train_by_test.sh
 │   ├── prepare_data.sh
 │   ├── train.sh
 │   └── train_one_stage.sh
@@ -133,6 +135,51 @@ Top-50/100/200 的 GT micro recall 分别约为 0.6754、0.8204 和 0.9274。
 
 测试脚本默认保留候选集与 GT 无交集的病例，避免评测偏高。构建训练集时应使用同一个
 Python 模块并设置 `--unreachable-policy drop`，因为此类训练样本没有排序学习信号。
+
+### 3.2 构造测试症状相关的训练子集
+
+开发阶段若完整训练集上的 GRPO 过慢，可以只根据测试集的输入症状构造较小训练集：
+
+```bash
+bash scripts/filter_train_by_test.sh
+```
+
+默认使用 `matched` 模式：将病例按完整症状组合分组，每个测试病例最多分配 2 条训练
+病例；测试症状组合在训练集中不存在时，使用症状 Jaccard 最近邻兜底。筛选器只读取
+测试集的 `extra_info.symptoms`，不会读取测试 GT、候选列表或奖励。输出为：
+
+```text
+data/processed/train_top50_test_matched.parquet
+data/processed/train_top50_test_matched.report.json
+```
+
+训练时显式指定该文件：
+
+```bash
+TRAIN_FILES=data/processed/train_top50_test_matched.parquet \
+  bash scripts/train.sh
+```
+
+通过 `TRAIN_PER_TEST` 控制规模，例如：
+
+```bash
+# 更快，约为每个测试病例保留 1 条训练病例
+TRAIN_PER_TEST=1 bash scripts/filter_train_by_test.sh
+
+# 更稳健，约为每个测试病例保留 3 条训练病例
+TRAIN_PER_TEST=3 bash scripts/filter_train_by_test.sh
+```
+
+还支持两个不限制组内数量的诊断模式：
+
+```bash
+FILTER_MODE=overlap bash scripts/filter_train_by_test.sh
+FILTER_MODE=exact bash scripts/filter_train_by_test.sh
+```
+
+注意：这是利用测试输入分布的 transductive 筛选。它适合快速调试，但正式论文实验应
+同时报告完整训练集结果，或对所有方法采用完全相同的筛选协议。更严格的开发流程可以
+将 `TEST_PARQUET` 指向验证集，以避免使用测试输入。
 
 ## 4. VERL Parquet 格式
 
