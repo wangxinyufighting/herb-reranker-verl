@@ -5,11 +5,12 @@ set -euo pipefail
 # VERL_ROOT 必须指向已经安装依赖的 VERL 仓库；本工程不会修改其中任何文件。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-: "${VERL_ROOT:?请设置 VERL_ROOT，例如 VERL_ROOT=/path/to/verl}"
+VERL_ROOT="${VERL_ROOT:-/root/autodl-tmp/verl}"
+EXP_TAG="${EXP_TAG:-v1}"
 
 TRAIN_FILES="${TRAIN_FILES:-${PROJECT_ROOT}/data/processed/train_top50.parquet}"
 VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/test_top50.parquet}"
-MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
+MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/models/Qwen3-1.7B}"
 
 # 奖励开关：on 为能力门控层级奖励，off 为固定联合 NDCG 消融基线。
 HIERARCHICAL_REWARD="${HIERARCHICAL_REWARD:-on}"
@@ -39,14 +40,14 @@ RESUME_MODE="${RESUME_MODE:-disable}"
 
 # 单卡 0.6B/1.7B 的保守默认值；可按显存和 GPU 数量通过环境变量覆盖。
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-1}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-16}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
-PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-1}"
-LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
+PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}"
+LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-8}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 ROLLOUT_TP="${ROLLOUT_TP:-1}"
 OUTPUT_K="${OUTPUT_K:-20}"
-GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.50}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
@@ -59,7 +60,7 @@ RELATIVE_EPSILON="${RELATIVE_EPSILON:-1e-6}"
 
 PROJECT_NAME="${PROJECT_NAME:-herb-reranker}"
 MODEL_NAME="${MODEL_PATH##*/}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-top20-relative-v2-${REWARD_MODE_TAG}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-top20-relative-v2-${REWARD_MODE_TAG}-${EXP_TAG}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/${EXPERIMENT_NAME}}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-20}"
@@ -140,6 +141,7 @@ python3 -m verl.trainer.main_ppo \
   +reward.custom_reward_function.reward_kwargs.format_weight=0.05 \
   +reward.custom_reward_function.reward_kwargs.anti_copy_bonus_weight="${ANTI_COPY_BONUS_WEIGHT}" \
   +reward.custom_reward_function.reward_kwargs.relative_epsilon="${RELATIVE_EPSILON}" \
+  +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.logger="['console', 'swanlab']" \
