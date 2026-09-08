@@ -7,8 +7,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CANDIDATE_K="${CANDIDATE_K:-50}"
-TRAIN_PARQUET="${TRAIN_PARQUET:-${PROJECT_ROOT}/data/processed/train_top${CANDIDATE_K}.parquet}"
-TEST_PARQUET="${TEST_PARQUET:-${PROJECT_ROOT}/data/processed/test_top${CANDIDATE_K}.parquet}"
+if [[ -n "${TRAIN_PARQUET:-}" ]]; then
+  TRAIN_PARQUET="${TRAIN_PARQUET}"
+elif [[ -f "${PROJECT_ROOT}/data/processed/train_top${CANDIDATE_K}.parquet" ]]; then
+  TRAIN_PARQUET="${PROJECT_ROOT}/data/processed/train_top${CANDIDATE_K}.parquet"
+else
+  TRAIN_PARQUET="${PROJECT_ROOT}/data/processed/train.parquet"
+fi
+if [[ -n "${TEST_PARQUET:-}" ]]; then
+  TEST_PARQUET="${TEST_PARQUET}"
+elif [[ -f "${PROJECT_ROOT}/data/processed/test_top${CANDIDATE_K}.parquet" ]]; then
+  TEST_PARQUET="${PROJECT_ROOT}/data/processed/test_top${CANDIDATE_K}.parquet"
+else
+  TEST_PARQUET="${PROJECT_ROOT}/data/processed/test.parquet"
+fi
 FILTER_MODE="${FILTER_MODE:-matched}"
 TRAIN_PER_TEST="${TRAIN_PER_TEST:-2}"
 FILTER_SEED="${FILTER_SEED:-42}"

@@ -1,97 +1,108 @@
-"""训练前检查 Parquet 是否使用当前 Top-K 候选 ID 协议。"""
+"""验证 Parquet 的药名协议、阶段和冻结参考，拒绝静默混用旧 ID 数据。"""
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-
-EXPECTED_ID_SCHEME = "deterministic_permuted_v1"
+from .prepare_data import SYSTEM_PROMPT, build_user_prompt, input_fingerprint
+from .reward import PROTOCOL, STAGES, names, normalize_stage, validate_reference
 
 
 def validate_protocol_row(
-    row: Mapping[str, Any], source: Path, row_index: int, expected_output_k: int
+    row: Mapping[str, Any],
+    source: Path,
+    row_index: int,
+    expected_output_k: int = 20,
+    training_stage: str | None = None,
 ) -> None:
-    """检查一条 VERL 样本；失败时给出可直接操作的重建提示。"""
-
     prefix = f"{source} 第 {row_index} 条"
     info = row.get("extra_info")
-    if not isinstance(info, Mapping):
-        raise ValueError(f"{prefix} 缺少 extra_info")
-
-    if info.get("candidate_id_scheme") != EXPECTED_ID_SCHEME:
-        raise ValueError(
-            f"{prefix} 不是新版候选 ID 协议；请重新运行 build_train_parquet.sh "
-            "和 build_test_parquet.sh"
-        )
-    if info.get("output_k") != expected_output_k:
-        raise ValueError(
-            f"{prefix} 的 output_k={info.get('output_k')!r}，"
-            f"但训练配置要求 {expected_output_k}"
-        )
-
-    candidates = info.get("candidate_herbs")
-    gnn_candidates = info.get("gnn_candidate_herbs")
+    if not isinstance(info, Mapping) or info.get("output_protocol") != PROTOCOL:
+        raise ValueError(f"{prefix}: 不是药名协议，请重新构建 Parquet")
+    if info.get("metric_convention") != "batch_test_method1_kmax20":
+        raise ValueError(f"{prefix}: metric 口径不匹配")
+    if expected_output_k < 20 or info.get("output_k") != expected_output_k:
+        raise ValueError(f"{prefix}: output_k 与训练配置不匹配")
+    stage = normalize_stage(info.get("training_stage"))
+    if training_stage is not None and stage != normalize_stage(training_stage):
+        raise ValueError(f"{prefix}: training_stage 与训练配置不匹配")
+    candidates = names(info.get("candidate_herbs"), "candidate_herbs")
+    gnn = names(info.get("gnn_candidate_herbs"), "gnn_candidate_herbs")
     if (
-        isinstance(candidates, (str, bytes))
-        or not isinstance(candidates, Sequence)
-        or isinstance(gnn_candidates, (str, bytes))
-        or not isinstance(gnn_candidates, Sequence)
-        or len(candidates) != len(gnn_candidates)
-        or set(candidates) != set(gnn_candidates)
+        candidates != gnn
+        or len(set(candidates)) != len(candidates)
+        or len(candidates) < expected_output_k
     ):
-        raise ValueError(f"{prefix} 的候选 ID 表与 GNN 原顺序不一致")
-    if expected_output_k > len(candidates):
-        raise ValueError(
-            f"{prefix} 只有 {len(candidates)} 个候选，少于 output_k={expected_output_k}"
+        raise ValueError(f"{prefix}: 候选列表不是唯一药名的 GNN 原始顺序")
+    if info.get("input_sha256") != input_fingerprint(dict(info)):
+        raise ValueError(f"{prefix}: 输入指纹不匹配")
+    if stage != "stage1":
+        validate_reference(
+            names(info.get("reference_ranking"), "reference_ranking"),
+            candidates,
+            expected_output_k,
         )
-
+        if not info.get("reference_checkpoint"):
+            raise ValueError(f"{prefix}: 缺少 reference_checkpoint")
     prompt = row.get("prompt")
-    if isinstance(prompt, (str, bytes)) or not isinstance(prompt, Sequence):
-        raise ValueError(f"{prefix} 的 prompt 不是消息列表")
-    prompt_text = "\n".join(
-        str(message.get("content", ""))
-        for message in prompt
-        if isinstance(message, Mapping)
-    )
-    if "GNN名次" not in prompt_text or f"最相关的 {expected_output_k} 个" not in prompt_text:
-        raise ValueError(f"{prefix} 的 Prompt 仍是旧版完整排列协议，请重新构建 Parquet")
+    if not isinstance(prompt, list) or not all(
+        isinstance(message, Mapping) for message in prompt
+    ):
+        raise ValueError(f"{prefix}: prompt 必须是消息列表")
+    text = "\n".join(str(message.get("content", "")) for message in prompt)
+    expected_prompt = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": build_user_prompt(
+                info["symptoms"],
+                info["symptom_description"],
+                candidates,
+                expected_output_k,
+            ),
+        },
+    ]
+    if prompt != expected_prompt:
+        raise ValueError(f"{prefix}: Prompt 与当前构建协议不一致，请重新构建")
+    if (
+        "原始症状描述：" + str(info["symptom_description"]) not in text
+        or "候选中药（初排顺序）：" + "、".join(candidates) not in text
+        or "<answer>" not in text
+        or "不得输出药名" in text
+        or "候选ID" in text
+    ):
+        raise ValueError(f"{prefix}: Prompt 与药名协议不匹配")
 
 
-def validate_parquet(path: Path, expected_output_k: int) -> int:
-    """流式检查一个 Parquet，返回样本数。"""
-
+def validate_parquet(
+    path: Path, expected_output_k: int = 20, training_stage: str | None = None
+) -> int:
     import pyarrow.parquet as pq
 
-    row_count = 0
-    parquet = pq.ParquetFile(path)
-    for batch in parquet.iter_batches(
+    count = 0
+    for batch in pq.ParquetFile(path).iter_batches(
         batch_size=1024, columns=["prompt", "extra_info"]
     ):
         for row in batch.to_pylist():
-            row_count += 1
-            validate_protocol_row(row, path, row_count, expected_output_k)
-    if row_count == 0:
+            count += 1
+            validate_protocol_row(row, path, count, expected_output_k, training_stage)
+    if not count:
         raise ValueError(f"{path} 不包含任何样本")
-    return row_count
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--files", type=Path, nargs="+", required=True)
-    parser.add_argument("--expected-output-k", type=int, default=20)
-    return parser.parse_args()
+    return count
 
 
 def main() -> None:
-    args = parse_args()
-    if args.expected_output_k <= 0:
-        raise ValueError("--expected-output-k 必须大于 0")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--files", type=Path, nargs="+", required=True)
+    parser.add_argument("--expected-output-k", type=int, default=20)
+    parser.add_argument("--training-stage", choices=STAGES)
+    args = parser.parse_args()
     for path in args.files:
-        count = validate_parquet(path, args.expected_output_k)
-        print(f"协议检查通过: {path} ({count} 条, output_k={args.expected_output_k})")
+        count = validate_parquet(path, args.expected_output_k, args.training_stage)
+        print(f"协议检查通过: {path} ({count} 条)")
 
 
 if __name__ == "__main__":

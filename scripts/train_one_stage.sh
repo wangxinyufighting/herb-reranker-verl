@@ -7,32 +7,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VERL_ROOT="${VERL_ROOT:-/root/autodl-tmp/verl}"
 EXP_TAG="${EXP_TAG:-v1}"
-
-TRAIN_FILES="${TRAIN_FILES:-${PROJECT_ROOT}/data/processed/train_top50.parquet}"
-VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/test_top50.parquet}"
-MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/models/Qwen3-1.7B}"
-
-# 奖励开关：on 为能力门控层级奖励，off 为固定联合 NDCG 消融基线。
-HIERARCHICAL_REWARD="${HIERARCHICAL_REWARD:-on}"
-case "${HIERARCHICAL_REWARD,,}" in
-  on|true|1|yes)
-    USE_HIERARCHICAL_REWARD=true
-    REWARD_MODE_TAG=hierarchical
-    ;;
-  off|false|0|no)
-    USE_HIERARCHICAL_REWARD=false
-    REWARD_MODE_TAG=fixed
-    ;;
-  *)
-    echo "HIERARCHICAL_REWARD 只能取 on 或 off，当前值: ${HIERARCHICAL_REWARD}" >&2
-    exit 1
-    ;;
+TRAINING_STAGE="${TRAINING_STAGE:-stage1}"
+case "${TRAINING_STAGE}" in
+  stage1|stage2|stage3) ;;
+  *) echo "TRAINING_STAGE 必须是 stage1、stage2 或 stage3" >&2; exit 1 ;;
 esac
+if [[ -n "${REWARD_MODE:-}" || -n "${HIERARCHICAL_REWARD:-}" ]]; then
+  echo "旧 reward 配置已停用，请改用 TRAINING_STAGE" >&2
+  exit 1
+fi
 
-HIERARCHICAL_EPSILON="${HIERARCHICAL_EPSILON:-0.1}"
-FIXED_WEIGHT_5="${FIXED_WEIGHT_5:-0.4}"
-FIXED_WEIGHT_10="${FIXED_WEIGHT_10:-0.3}"
-FIXED_WEIGHT_20="${FIXED_WEIGHT_20:-0.3}"
+if [[ -z "${TRAIN_FILES:-}" ]]; then
+  if [[ -f "${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train_top50.parquet" ]]; then
+    TRAIN_FILES="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train_top50.parquet"
+  else
+    # ``prepare_data.sh`` (the small JSONL/example path) uses the shorter name.
+    TRAIN_FILES="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train.parquet"
+  fi
+fi
+VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/val.parquet}"
+if [[ "${TRAINING_STAGE}" != stage1 && -z "${MODEL_PATH:-}" ]]; then
+  echo "Stage 2/3 必须指定上一阶段选定的 MODEL_PATH" >&2
+  exit 1
+fi
+MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/models/Qwen3-1.7B}"
 
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
 # 新的 Top-20/相对奖励协议与旧 checkpoint 不兼容，默认禁止自动恢复。
@@ -44,23 +42,22 @@ TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}"
 PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-16}"
 PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}"
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-8}"
-ROLLOUT_N="${ROLLOUT_N:-8}"
+ROLLOUT_N="${ROLLOUT_N:-16}"
 ROLLOUT_TP="${ROLLOUT_TP:-1}"
 OUTPUT_K="${OUTPUT_K:-20}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
-MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-256}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-512}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 KL_COEF="${KL_COEF:-1e-3}"
 ENTROPY_COEFF="${ENTROPY_COEFF:-0.005}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.2}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-0.95}"
-ANTI_COPY_BONUS_WEIGHT="${ANTI_COPY_BONUS_WEIGHT:-0.05}"
-RELATIVE_EPSILON="${RELATIVE_EPSILON:-1e-6}"
+NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-true}"
 
 PROJECT_NAME="${PROJECT_NAME:-herb-reranker}"
 MODEL_NAME="${MODEL_PATH##*/}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-top20-relative-v2-${REWARD_MODE_TAG}-${EXP_TAG}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-names-${TRAINING_STAGE}-${EXP_TAG}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/${EXPERIMENT_NAME}}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-20}"
@@ -83,15 +80,17 @@ fi
 # 通过 PYTHONPATH 引用外部仓库，不复制也不修改 VERL 源码。
 export PYTHONPATH="${PROJECT_ROOT}:${VERL_ROOT}:${PYTHONPATH:-}"
 
-# 防止旧版“完整输出50项”Parquet 与新版 Top-20 reward 静默混用。
+# 防止旧 ID 数据或其他训练阶段的 Parquet 静默混用。
 python3 -m herb_reranker.validate_parquet \
   --files "${TRAIN_FILES}" "${VAL_FILES}" \
-  --expected-output-k "${OUTPUT_K}"
+  --expected-output-k "${OUTPUT_K}" \
+  --training-stage "${TRAINING_STAGE}"
 
 cd "${VERL_ROOT}"
 
 python3 -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo \
+  algorithm.norm_adv_by_std_in_grpo="${NORM_ADV_BY_STD}" \
   algorithm.use_kl_in_reward=False \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="${VAL_FILES}" \
@@ -132,15 +131,9 @@ python3 -m verl.trainer.main_ppo \
   reward.reward_manager.name=naive \
   reward.custom_reward_function.path="${PROJECT_ROOT}/herb_reranker/reward.py" \
   reward.custom_reward_function.name=compute_score \
-  +reward.custom_reward_function.reward_kwargs.use_hierarchical_reward="${USE_HIERARCHICAL_REWARD}" \
-  +reward.custom_reward_function.reward_kwargs.hierarchical_epsilon="${HIERARCHICAL_EPSILON}" \
-  +reward.custom_reward_function.reward_kwargs.fixed_weight_5="${FIXED_WEIGHT_5}" \
-  +reward.custom_reward_function.reward_kwargs.fixed_weight_10="${FIXED_WEIGHT_10}" \
-  +reward.custom_reward_function.reward_kwargs.fixed_weight_20="${FIXED_WEIGHT_20}" \
-  +reward.custom_reward_function.reward_kwargs.rank_weight=0.95 \
-  +reward.custom_reward_function.reward_kwargs.format_weight=0.05 \
-  +reward.custom_reward_function.reward_kwargs.anti_copy_bonus_weight="${ANTI_COPY_BONUS_WEIGHT}" \
-  +reward.custom_reward_function.reward_kwargs.relative_epsilon="${RELATIVE_EPSILON}" \
+  +reward.custom_reward_function.reward_kwargs.training_stage="${TRAINING_STAGE}" \
+  +reward.custom_reward_function.reward_kwargs.output_k="${OUTPUT_K}" \
+  +reward.custom_reward_function.reward_kwargs.format_weight=0.1 \
   +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \

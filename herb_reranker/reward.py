@@ -1,561 +1,293 @@
-"""VERL 自定义奖励函数。
+"""Name-based reward derived from the original rerank_reward.
 
-本文件刻意不导入 VERL：VERL 会按文件路径动态加载 ``compute_score``，而纯标准库
-实现便于在普通 Python 环境中单独测试。奖励只评价候选列表内部的相对排序，不把
-召回器未提供的真实中药归咎于 reranker。
+Use metric.py's batch_test NDCG (method=1, k_max=20). Stage objectives are
+lexicographic: Top-5, then Top-10 under a Top-5 floor, then Top-20 under both
+floors. The floors come from frozen previous-checkpoint predictions, not GT.
 """
 
 from __future__ import annotations
 
-import json
 import math
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Mapping
 from typing import Any
 
-
-def _clip(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
-    """把浮点数截断到闭区间。"""
-
-    return max(lower, min(upper, value))
-
-
-def _as_bool(value: Any) -> bool:
-    """安全解析 Hydra/环境变量传入的布尔值，避免字符串 ``"false"`` 被当成真。"""
-
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"true", "1", "yes", "on"}:
-            return True
-        if normalized in {"false", "0", "no", "off"}:
-            return False
-        raise ValueError(f"无法解析布尔值: {value!r}")
-    return bool(value)
+CUTOFFS = (5, 10, 20)
+STAGES = ("stage1", "stage2", "stage3")
+PROTOCOL = "herb_names_v1"
+ANSWER_RE = re.compile(r"<answer>(.*?)</answer>", re.DOTALL)
+THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
 
 
-def competence_gate(score: float, epsilon: float = 0.1) -> float:
-    """根据已达到的前缀质量，连续控制下一层排序目标的强度。
-
-    ``epsilon`` 是最小开放程度。即使 Top-5 暂时没有命中，Top-10/20 仍保留微弱
-    信号，从而避免 GRPO 组内所有排序奖励都为零。
-    """
-
-    eps = _clip(float(epsilon))
-    return eps + (1.0 - eps) * _clip(float(score))
+def normalize_stage(value: Any) -> str:
+    stage = str(value).strip().lower()
+    stage = {"1": "stage1", "2": "stage2", "3": "stage3"}.get(stage, stage)
+    if stage not in STAGES:
+        raise ValueError(f"training_stage must be one of {STAGES}, got {value!r}")
+    return stage
 
 
-def hierarchical_rank_reward(
-    ndcg_5: float,
-    ndcg_10: float,
-    ndcg_20: float,
-    epsilon: float = 0.1,
-) -> float:
-    """能力门控的层级排序奖励。
-
-    Top-5 始终直接优化；Top-10 由 Top-5 质量软激活；Top-20 只有在 Top-5 和
-    Top-10 都较好时才充分激活。该奖励不依赖 epoch 或 global step，因此可在一次
-    VERL 训练中完成样本级自节奏学习。
-    """
-
-    score_5 = _clip(float(ndcg_5))
-    score_10 = _clip(float(ndcg_10))
-    score_20 = _clip(float(ndcg_20))
-    gate_5 = competence_gate(score_5, epsilon)
-    gate_10 = competence_gate(score_10, epsilon)
-    return (score_5 + gate_5 * score_10 + gate_5 * gate_10 * score_20) / 3.0
-
-
-def fixed_joint_rank_reward(
-    ndcg_5: float,
-    ndcg_10: float,
-    ndcg_20: float,
-    weight_5: float = 0.4,
-    weight_10: float = 0.3,
-    weight_20: float = 0.3,
-) -> float:
-    """不使用能力门控时的固定联合奖励，用作严格消融对照。"""
-
-    weights = [
-        max(0.0, float(weight_5)),
-        max(0.0, float(weight_10)),
-        max(0.0, float(weight_20)),
-    ]
-    normalizer = sum(weights)
-    if normalizer == 0.0:
-        weights, normalizer = [0.4, 0.3, 0.3], 1.0
-    scores = [_clip(float(ndcg_5)), _clip(float(ndcg_10)), _clip(float(ndcg_20))]
-    return sum(weight * score for weight, score in zip(weights, scores)) / normalizer
-
-
-def relative_improvement_reward(
-    model_score: float,
-    baseline_score: float,
-    epsilon: float = 1e-6,
-) -> float:
-    """把相对 GNN 的改进按当前病例的可用空间归一化到 ``[-1, 1]``。
-
-    复制 GNN 固定得到 0；提升得到正值；退化得到负值。正向分母是理论上限与
-    baseline 的距离，负向分母是 baseline 与 0 的距离，因此不同难度病例的奖励
-    尺度更接近。该设计保留质量次序，不会像直接 copy penalty 那样奖励无意义打乱。
-    """
-
-    model = _clip(float(model_score))
-    baseline = _clip(float(baseline_score))
-    delta = model - baseline
-    eps = max(float(epsilon), 1e-12)
-    if delta >= 0.0:
-        normalized = delta / max(1.0 - baseline, eps)
-    else:
-        normalized = delta / max(baseline, eps)
-    return max(-1.0, min(1.0, normalized))
-
-
-def _string_list(value: Any) -> list[str]:
-    """把列表型字段规范化为去除首尾空白的字符串列表。
-
-    字符串本身不能被当作字符序列展开；非列表值直接视为空，奖励函数因此不会
-    因单条脏样本抛异常而中断整个分布式训练任务。
-    """
-
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        return []
-    result: list[str] = []
-    for item in value:
-        if isinstance(item, str) and item.strip():
-            result.append(item.strip())
+def names(value: Any, label: str, allow_empty: bool = False) -> list[str]:
+    # Parquet/VERL may supply numpy arrays, so do not require list specifically.
+    if value is None or isinstance(value, (str, bytes, Mapping)):
+        raise ValueError(f"{label} must be a list of herb names")
+    try:
+        result = list(value)
+    except TypeError as exc:
+        raise ValueError(f"{label} must be a list of herb names") from exc
+    if any(not isinstance(item, str) or not item.strip() for item in result):
+        raise ValueError(f"{label} contains an empty or non-string name")
+    result = [item.strip() for item in result]
+    if not result and not allow_empty:
+        raise ValueError(f"{label} must not be empty")
     return result
 
 
-def _extract_ground_truth(ground_truth: Any) -> list[str]:
-    """兼容字典、列表以及 JSON 字符串形式的 ground truth。"""
-
-    value = ground_truth
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except json.JSONDecodeError:
-            return []
-    if isinstance(value, Mapping):
-        value = value.get("ground_truth_herbs", value.get("herbs", []))
-    return _string_list(value)
+def dedup_preserve_order(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
 
 
-def _extract_json_ranking(solution: Any) -> tuple[list[Any], float, float]:
-    """从模型输出中提取 ``ranking`` 数组。
-
-    返回值依次是原始数组、JSON 是否可解析、ranking 是否为列表。扫描 JSON 对象而
-    不是简单正则，是为了兼容 Markdown 代码块以及 Qwen 偶尔残留的思考文本。
-    输出协议本身仍是严格 JSON；兼容解析仅用于避免无关包装掩盖真实排序质量。
-    """
-
-    if not isinstance(solution, str):
-        return [], 0.0, 0.0
-
-    text = solution.strip()
-    if "</think>" in text:
-        # Qwen3 若没有完全遵守 /no_think，答案通常位于最后一个闭合标签之后。
-        text = text.rsplit("</think>", maxsplit=1)[-1].strip()
-
-    decoder = json.JSONDecoder()
-    saw_json_object = False
-    for index, char in enumerate(text):
-        if char != "{":
-            continue
-        try:
-            obj, _ = decoder.raw_decode(text[index:])
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(obj, Mapping):
-            continue
-        saw_json_object = True
-        if "ranking" in obj:
-            ranking = obj["ranking"]
-            if isinstance(ranking, list):
-                return ranking, 1.0, 1.0
-            return [], 1.0, 0.0
-
-    return [], float(saw_json_object), 0.0
-
-
-def _map_index_ranking(
-    raw_ranking: Sequence[Any], candidates: Sequence[str]
-) -> tuple[list[str | None], list[str], dict[str, int]]:
-    """把 1-based 候选序号映射成药名，同时保留非法位置。
-
-    ``metric_ranking`` 中的 ``None`` 会作为一次错误占位，因此重复、越界、布尔值、
-    字符串序号都不能通过过滤非法项而获得更靠前的名次。``valid_unique`` 只用于计算
-    输出合法率和候选覆盖率。第三个返回值拆分记录重复、非法和遗漏序号，便于定位
-    模型究竟在哪一种约束上失败。
-    """
-
-    metric_ranking: list[str | None] = []
-    valid_unique: list[str] = []
-    seen_indices: set[int] = set()
-    duplicate_count = 0
-    invalid_count = 0
-
-    for item in raw_ranking:
-        # bool 是 int 的子类，必须显式排除，避免 true/false 被当成 1/0。
-        if isinstance(item, bool) or not isinstance(item, int):
-            invalid_count += 1
-            metric_ranking.append(None)
-            continue
-        if item < 1 or item > len(candidates):
-            invalid_count += 1
-            metric_ranking.append(None)
-            continue
-        if item in seen_indices:
-            duplicate_count += 1
-            metric_ranking.append(None)
-            continue
-
-        seen_indices.add(item)
-        herb = candidates[item - 1]
-        metric_ranking.append(herb)
-        valid_unique.append(herb)
-
-    diagnostics = {
-        "duplicate_index_count": duplicate_count,
-        "invalid_index_count": invalid_count,
-        "missing_index_count": max(0, len(candidates) - len(valid_unique)),
-    }
-    return metric_ranking, valid_unique, diagnostics
-
-
-def _copy_ratio_at_k(
-    ranking: Sequence[str | None], candidates: Sequence[str], cutoff: int
-) -> float:
-    """前 k 个位置与 GNN 原排序完全相同的比例，仅作为诊断而不参与奖励。"""
-
-    compared = min(cutoff, len(candidates))
-    if compared <= 0:
-        return 0.0
-    matches = sum(
-        rank < len(ranking) and ranking[rank] == candidates[rank]
-        for rank in range(compared)
+def dcg_at_k(relevance: list[float], k: int) -> float:
+    return sum(
+        value / math.log2(index + 2) for index, value in enumerate(relevance[:k])
     )
-    return matches / compared
 
 
-def _precision_at_k(
-    ranking: Sequence[str | None], relevant: set[str], cutoff: int
+def batch_test_ndcg(relevance: list[float], k: int, k_max: int = 20) -> float:
+    relevance = relevance[:k_max]
+    ideal = dcg_at_k(sorted(relevance, reverse=True), k)
+    return dcg_at_k(relevance, k) / ideal if ideal else 0.0
+
+
+def ranking_metrics(
+    ranking: list[str], gt: list[str], candidates: list[str]
+) -> dict[str, float]:
+    """Dedup before truncation; full GT denominator for recall, as in old reward."""
+    gt_set = set(gt)
+    reachable = gt_set & set(candidates)
+    relevance = [
+        float(name in reachable) for name in dedup_preserve_order(ranking)[:20]
+    ]
+    result: dict[str, float] = {}
+    for k in CUTOFFS:
+        hits = sum(relevance[:k])
+        precision = hits / k
+        recall = hits / len(gt_set) if gt_set else 0.0
+        result.update(
+            {
+                f"hits_{k}": hits,
+                f"precision_{k}": precision,
+                f"recall_{k}": recall,
+                f"f1_{k}": 2 * precision * recall / (precision + recall)
+                if hits
+                else 0.0,
+                f"ndcg_{k}": batch_test_ndcg(relevance, k),
+            }
+        )
+    return result
+
+
+def stage_score(
+    metrics: Mapping[str, float],
+    reference: Mapping[str, float],
+    reachable: int,
+    stage: str,
 ) -> float:
-    """标准 Precision@k；输出不足 k 个位置时，缺失位置按未命中处理。"""
+    """Mixed-radix scalarization: a one-hit priority change dominates the tail.
 
-    if cutoff <= 0:
+    Starting NDCG in [0, 1/2] makes every lower-priority tail strictly < 1.
+    Radices are derived from attainable hit counts, not fitted metric weights.
+    """
+    if not reachable:
         return 0.0
-    hits = sum(herb in relevant for herb in ranking[:cutoff])
-    return hits / cutoff
+    target = {"stage1": 5, "stage2": 10, "stage3": 20}[stage]
+    components = []
+    for k in CUTOFFS:
+        if k >= target:
+            break
+        limit = min(k, reachable)
+        deficit = max(0.0, reference[f"hits_{k}"] - metrics[f"hits_{k}"])
+        components.append((limit - deficit, limit))
+    components.append((metrics[f"hits_{target}"], min(target, reachable)))
+    encoded = metrics[f"ndcg_{target}"] / 2.0
+    for value, maximum in reversed(components):
+        encoded = (value + encoded) / (maximum + 1.0)
+    return encoded
 
 
-def _recall_at_k(
-    ranking: Sequence[str | None], ground_truth: set[str], cutoff: int
-) -> float:
-    """标准端到端 Recall@k，分母包含候选集未召回的 GT。"""
+def parse_answer(solution: str) -> tuple[list[str], bool, int]:
+    """Do not repair, map IDs, accept aliases, or fill the tail using GNN/GT."""
+    matches = list(ANSWER_RE.finditer(solution))
+    think = THINK_RE.search(solution)
+    if len(matches) != 1:
+        return [], False, len(think.group(1).strip()) if think else 0
+    body = matches[0].group(1).strip()
+    ranking = [part.strip() for part in body.split(">")]
+    clean = bool(body) and all(ranking) and not any("<" in name for name in ranking)
+    return ranking if body else [], clean, len(think.group(1).strip()) if think else 0
 
-    if not ground_truth or cutoff <= 0:
-        return 0.0
-    hits = sum(herb in ground_truth for herb in ranking[:cutoff])
-    return hits / len(ground_truth)
 
-
-def _ndcg_at_k(
-    ranking: Sequence[str | None], relevant: set[str], cutoff: int
-) -> float:
-    """计算二元相关性的 NDCG@cutoff；没有可达 GT 时返回 0。"""
-
-    if not relevant or cutoff <= 0:
-        return 0.0
-
-    dcg = 0.0
-    for rank, herb in enumerate(ranking[:cutoff], start=1):
-        if herb in relevant:
-            dcg += 1.0 / math.log2(rank + 1.0)
-
-    ideal_hits = min(cutoff, len(relevant))
-    idcg = sum(1.0 / math.log2(rank + 1.0) for rank in range(1, ideal_hits + 1))
-    return dcg / idcg if idcg > 0.0 else 0.0
+def validate_reference(
+    reference: list[str], candidates: list[str], output_k: int
+) -> None:
+    if (
+        len(reference) < output_k
+        or len(set(reference)) != len(reference)
+        or not set(reference) <= set(candidates)
+    ):
+        raise ValueError(
+            "reference_ranking must contain at least output_k unique candidate names"
+        )
 
 
 def compute_score(
-    data_source: str,
-    solution_str: str,
-    ground_truth: Any,
+    *args: Any,
+    data_source: str = "",
+    solution_str: Any = None,
+    ground_truth: Any = None,
     extra_info: Mapping[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, float]:
-    """计算一个生成结果的规则奖励，签名与 VERL 自定义奖励接口一致。
-
-    可通过 ``reward.custom_reward_function.reward_kwargs`` 传入：
-    - ``use_hierarchical_reward``：是否启用能力门控，默认启用；
-    - ``hierarchical_epsilon``：能力门控的最小开放程度，默认 0.1；
-    - ``fixed_weight_5/10/20``：关闭门控后的固定联合权重；
-    - ``rank_weight``：排序项权重，默认 0.95；
-    - ``format_weight``：格式项权重，默认 0.05。
-    - ``anti_copy_bonus_weight``：只放大真实改进且非复制的奖励，默认 0.05；
-    - ``relative_epsilon``：相对提升归一化的数值稳定项，默认 1e-6。
-
-    ``data_source`` 目前不参与计算，但必须保留在签名中供 VERL 调用。
-    """
-
-    del data_source  # 明确说明该参数仅用于满足 VERL 接口。
-    info = extra_info if isinstance(extra_info, Mapping) else {}
-    candidates = _string_list(info.get("candidate_herbs", []))
-    gnn_candidates = _string_list(info.get("gnn_candidate_herbs", []))
-    targets = _extract_ground_truth(ground_truth)
-
-    # candidates 按输出 ID 排列；gnn_candidates 保留召回器原顺序。旧数据没有后者时
-    # 自动回退，保证 reward 仍可解析，但新版训练必须重建 Parquet 才能消除序号捷径。
-    candidates = list(dict.fromkeys(candidates))
-    candidate_set = set(candidates)
-    gnn_candidates = list(dict.fromkeys(gnn_candidates))
-    if len(gnn_candidates) != len(candidates) or set(gnn_candidates) != candidate_set:
-        gnn_candidates = candidates
-    relevant = set(targets) & candidate_set
-
-    candidate_count = len(candidates)
-    default_output_k = min(20, candidate_count)
-    raw_output_k = info.get("output_k", default_output_k)
-    try:
-        output_k = int(raw_output_k)
-    except (TypeError, ValueError):
-        output_k = default_output_k
-    if isinstance(raw_output_k, bool) or output_k <= 0 or output_k > candidate_count:
-        output_k = default_output_k
-
-    raw_ranking, json_ok, list_ok = _extract_json_ranking(solution_str)
-    raw_output_count = len(raw_ranking)
-    model_ranking, valid_unique, index_diagnostics = _map_index_ranking(
-        raw_ranking, candidates
-    )
-
-    # 分母使用原始数组长度，使重复、越界、字符串和空值都受到惩罚，不能在过滤后“消失”。
-    candidate_precision = len(valid_unique) / max(raw_output_count, 1)
-    candidate_coverage = len(valid_unique) / candidate_count if candidate_count else 0.0
-    required_output_coverage = (
-        min(len(valid_unique), output_k) / output_k if output_k else 0.0
-    )
-    constraint_quality = candidate_precision * required_output_coverage
-
-    exact_topk = float(
-        bool(candidates)
-        and list_ok == 1.0
-        and raw_output_count == output_k
-        and len(valid_unique) == output_k
-    )
-
-    # 仅保留该字段供旧面板兼容；Top-20 协议下不再要求完整候选排列。
-    exact_permutation = float(
-        bool(candidates)
-        and list_ok == 1.0
-        and raw_output_count == candidate_count
-        and len(valid_unique) == candidate_count
-    )
-
-    cutoffs = (5, 10, 15, 20)
-    target_set = set(targets)
-    model_precision = {
-        cutoff: _precision_at_k(model_ranking, relevant, cutoff)
-        for cutoff in cutoffs
-    }
-    model_recall = {
-        cutoff: _recall_at_k(model_ranking, target_set, cutoff)
-        for cutoff in cutoffs
-    }
-    # reward_ndcg 只评价候选内部排序；这是标量 reward 使用的条件化 NDCG。
-    reward_ndcg = {
-        cutoff: _ndcg_at_k(model_ranking, relevant, cutoff)
-        for cutoff in cutoffs
-    }
-
-    # model/gnn NDCG 是论文测试口径：IDCG 使用完整 GT。这样三类 test 指标
-    # （Precision、Recall、NDCG）都包含 retriever 的召回上限，可与原 GNN 直接比较。
-    model_ndcg = {
-        cutoff: _ndcg_at_k(model_ranking, target_set, cutoff)
-        for cutoff in cutoffs
-    }
-
-    # Oracle 只能重排当前候选，不能引入候选外 GT。它给出固定 retriever 下的理论上限。
-    oracle_ranking = [herb for herb in gnn_candidates if herb in relevant]
-    oracle_ranking.extend(herb for herb in gnn_candidates if herb not in relevant)
-    oracle_precision = {
-        cutoff: _precision_at_k(oracle_ranking, relevant, cutoff)
-        for cutoff in cutoffs
-    }
-    oracle_recall = {
-        cutoff: _recall_at_k(oracle_ranking, target_set, cutoff)
-        for cutoff in cutoffs
-    }
-    oracle_ndcg = {
-        cutoff: _ndcg_at_k(oracle_ranking, target_set, cutoff)
-        for cutoff in cutoffs
-    }
-
-    # GNN 原始候选顺序是不经过训练的 test baseline。验证时返回其指标，SwanLab
-    # 会与模型指标一起按测试集求均值，因此无需修改 VERL 或额外跑一遍评测脚本。
-    gnn_precision = {
-        cutoff: _precision_at_k(gnn_candidates, relevant, cutoff)
-        for cutoff in cutoffs
-    }
-    gnn_recall = {
-        cutoff: _recall_at_k(gnn_candidates, target_set, cutoff)
-        for cutoff in cutoffs
-    }
-    gnn_ndcg = {
-        cutoff: _ndcg_at_k(gnn_candidates, target_set, cutoff)
-        for cutoff in cutoffs
-    }
-    gnn_reward_ndcg = {
-        cutoff: _ndcg_at_k(gnn_candidates, relevant, cutoff)
-        for cutoff in cutoffs
-    }
-    use_hierarchical = _as_bool(kwargs.get("use_hierarchical_reward", True))
-    epsilon = _clip(float(kwargs.get("hierarchical_epsilon", 0.1)))
-    gate_5 = competence_gate(reward_ndcg[5], epsilon)
-    gate_10 = competence_gate(reward_ndcg[10], epsilon)
-
-    if use_hierarchical:
-        rank_score = hierarchical_rank_reward(
-            ndcg_5=reward_ndcg[5],
-            ndcg_10=reward_ndcg[10],
-            ndcg_20=reward_ndcg[20],
-            epsilon=epsilon,
-        )
-        gnn_rank_score = hierarchical_rank_reward(
-            ndcg_5=gnn_reward_ndcg[5],
-            ndcg_10=gnn_reward_ndcg[10],
-            ndcg_20=gnn_reward_ndcg[20],
-            epsilon=epsilon,
-        )
-    else:
-        rank_score = fixed_joint_rank_reward(
-            ndcg_5=reward_ndcg[5],
-            ndcg_10=reward_ndcg[10],
-            ndcg_20=reward_ndcg[20],
-            weight_5=float(kwargs.get("fixed_weight_5", 0.4)),
-            weight_10=float(kwargs.get("fixed_weight_10", 0.3)),
-            weight_20=float(kwargs.get("fixed_weight_20", 0.3)),
-        )
-        gnn_rank_score = fixed_joint_rank_reward(
-            ndcg_5=gnn_reward_ndcg[5],
-            ndcg_10=gnn_reward_ndcg[10],
-            ndcg_20=gnn_reward_ndcg[20],
-            weight_5=float(kwargs.get("fixed_weight_5", 0.4)),
-            weight_10=float(kwargs.get("fixed_weight_10", 0.3)),
-            weight_20=float(kwargs.get("fixed_weight_20", 0.3)),
-        )
-
-    # 采用分级格式分数诊断不同错误。只有严格满足 Top-K 协议的输出才获得任务奖励；
-    # 非法输出统一落在合法输出的理论下界以下，避免残缺答案胜过合法但较差的排序。
-    length_score = (
-        max(0.0, 1.0 - abs(raw_output_count - output_k) / output_k)
-        if output_k
-        else 0.0
-    )
-    format_score = (
-        0.15 * json_ok
-        + 0.15 * list_ok
-        + 0.25 * candidate_precision
-        + 0.25 * required_output_coverage
-        + 0.20 * length_score
-    )
-
-    rank_weight = _clip(float(kwargs.get("rank_weight", 0.95)))
-    format_weight = _clip(float(kwargs.get("format_weight", 0.05)))
-    normalizer = rank_weight + format_weight
-    if normalizer == 0.0:
-        rank_weight, format_weight, normalizer = 0.95, 0.05, 1.0
-    rank_weight /= normalizer
-    format_weight /= normalizer
-
-    relative_epsilon = max(float(kwargs.get("relative_epsilon", 1e-6)), 1e-12)
-    relative_improvement = relative_improvement_reward(
-        model_score=rank_score,
-        baseline_score=gnn_rank_score,
-        epsilon=relative_epsilon,
-    )
-    copy_ratio_output = _copy_ratio_at_k(
-        model_ranking, gnn_candidates, output_k
-    )
-    anti_copy_bonus_weight = _clip(
-        float(kwargs.get("anti_copy_bonus_weight", 0.05))
-    )
-    # 只放大“已经优于 GNN 且确实改变位置”的输出。退化排序不会因为不同而获奖。
-    anti_copy_bonus = (
-        anti_copy_bonus_weight
-        * max(relative_improvement, 0.0)
-        * (1.0 - copy_ratio_output)
-    )
-
-    if exact_topk == 1.0:
-        total_score = (
-            rank_weight * relative_improvement
-            + format_weight * format_score
-            + anti_copy_bonus
-        )
-        total_score = max(-1.0, min(1.0, total_score))
-    else:
-        # 合法输出最低为 -rank_weight+format_weight；非法输出最高约为 -0.975。
-        # 分级 format_score 仍能在训练初期区分完全不可解析与接近合法的答案。
-        total_score = -1.0 + 0.5 * format_weight * format_score
-
-    # score 是 VERL 使用的主奖励。Precision/Recall 只作为 reward extra metrics
-    # 监控，不直接叠加到标量奖励，避免与二元 NDCG 中的命中数重复计权。
-    metrics = {
-        "score": float(total_score),
-        "rank_score": float(rank_score),
-        "gnn_rank_score": float(gnn_rank_score),
-        "rank_delta": float(rank_score - gnn_rank_score),
-        "relative_improvement": float(relative_improvement),
-        "anti_copy_bonus": float(anti_copy_bonus),
-        # 保留旧键名，避免已有 SwanLab 面板和分析脚本失效。
-        "ndcg_5": float(reward_ndcg[5]),
-        "ndcg_10": float(reward_ndcg[10]),
-        "ndcg_15": float(reward_ndcg[15]),
-        "ndcg_20": float(reward_ndcg[20]),
-        "gate_5": float(gate_5),
-        "gate_10": float(gate_10),
-        "hierarchical_reward_enabled": float(use_hierarchical),
-        "format_score": float(format_score),
-        "candidate_precision": float(candidate_precision),
-        "candidate_coverage": float(candidate_coverage),
-        "required_output_coverage": float(required_output_coverage),
-        "constraint_quality": float(constraint_quality),
-        "length_score": float(length_score),
-        "output_k": float(output_k),
-        "valid_output": float(exact_topk),
-        "exact_topk": float(exact_topk),
-        "exact_permutation": float(exact_permutation),
-        "reachable_gt_count": float(len(relevant)),
-        "duplicate_index_count": float(index_diagnostics["duplicate_index_count"]),
-        "invalid_index_count": float(index_diagnostics["invalid_index_count"]),
-        "missing_index_count": float(max(0, output_k - len(valid_unique))),
-        "extra_index_count": float(max(0, raw_output_count - output_k)),
-        "unranked_candidate_count": float(max(0, candidate_count - len(valid_unique))),
-        "copy_ratio_output": float(copy_ratio_output),
-    }
-    for cutoff in cutoffs:
-        copy_ratio = _copy_ratio_at_k(model_ranking, gnn_candidates, cutoff)
-        metrics[f"copy_ratio_{cutoff}"] = copy_ratio
-        metrics[f"exact_copy_{cutoff}"] = float(
-            exact_topk == 1.0 and copy_ratio == 1.0
-        )
-
-        for metric_name, model_values, gnn_values, oracle_values in (
-            ("precision", model_precision, gnn_precision, oracle_precision),
-            ("recall", model_recall, gnn_recall, oracle_recall),
-            ("ndcg", model_ndcg, gnn_ndcg, oracle_ndcg),
-        ):
-            model_value = float(model_values[cutoff])
-            gnn_value = float(gnn_values[cutoff])
-            oracle_value = float(oracle_values[cutoff])
-            metrics[f"model_{metric_name}_{cutoff}"] = model_value
-            metrics[f"gnn_{metric_name}_{cutoff}"] = gnn_value
-            metrics[f"oracle_{metric_name}_{cutoff}"] = oracle_value
-            metrics[f"delta_{metric_name}_{cutoff}"] = model_value - gnn_value
-            metrics[f"headroom_{metric_name}_{cutoff}"] = oracle_value - gnn_value
-            metrics[f"remaining_gap_{metric_name}_{cutoff}"] = (
-                oracle_value - model_value
+    """Accept VERL and original reward call conventions, including keyword calls."""
+    if args:
+        if len(args) in (2, 3) and isinstance(args[1], Mapping):
+            solution_str, ground_truth = args[:2]
+            if len(args) == 3:
+                data_source = args[2]
+        elif len(args) in (3, 4):
+            data_source, solution_str, ground_truth = args[:3]
+            if len(args) == 4:
+                extra_info = args[3]
+        else:
+            raise TypeError(
+                "Expected (solution, gt) or (data_source, solution, gt, extra_info)"
             )
-    return metrics
+    if not isinstance(ground_truth, Mapping):
+        raise ValueError("ground_truth must contain gt_herbs or ground_truth_herbs")
+    info = dict(extra_info or {})
+    if (
+        info.get("candidate_id_scheme")
+        or info.get("output_protocol", PROTOCOL) != PROTOCOL
+    ):
+        raise ValueError("Old ID-protocol data must be rebuilt for the name reward")
+    candidates = names(
+        info.get("candidate_herbs", ground_truth.get("candidate_herbs")),
+        "candidate_herbs",
+    )
+    gnn = names(info.get("gnn_candidate_herbs", candidates), "gnn_candidate_herbs")
+    if (
+        len(set(candidates)) != len(candidates)
+        or len(set(gnn)) != len(gnn)
+        or set(gnn) != set(candidates)
+    ):
+        raise ValueError(
+            "candidate_herbs and gnn_candidate_herbs must be unique and have the same names"
+        )
+    gt = names(
+        ground_truth.get("ground_truth_herbs", ground_truth.get("gt_herbs")),
+        "ground_truth_herbs",
+        allow_empty=True,
+    )
+    stage = normalize_stage(
+        kwargs.get("training_stage", info.get("training_stage", "stage1"))
+    )
+    if info.get("training_stage") and normalize_stage(info["training_stage"]) != stage:
+        raise ValueError(
+            "reward stage disagrees with Parquet training_stage; rebuild stage data"
+        )
+    output_k = int(kwargs.get("output_k", info.get("output_k", 20)))
+    if info.get("output_k", output_k) != output_k:
+        raise ValueError("reward output_k disagrees with Parquet")
+    if output_k < 20 or output_k > len(candidates):
+        raise ValueError(
+            "output_k must be between 20 and candidate count (metric k_max=20)"
+        )
+    if stage == "stage1":
+        reference = gnn[:output_k]
+    else:
+        # Silent fallback to GNN would stop protecting the preceding checkpoint.
+        reference = names(info.get("reference_ranking"), "reference_ranking")
+        validate_reference(reference, candidates, output_k)
+    text = str(solution_str or "")
+    ranking, parse_ok, think_chars = parse_answer(text)
+    unique = dedup_preserve_order(ranking)
+    invalid = sum(name not in set(candidates) for name in ranking)
+    duplicates = len(ranking) - len(unique)
+    shortfall = max(0, output_k - len(set(unique) & set(candidates)))
+    valid = parse_ok and not invalid and not duplicates and not shortfall
+
+    reachable_set = set(gt) & set(candidates)
+    ideal = [name for name in gnn if name in reachable_set] + [
+        name for name in gnn if name not in reachable_set
+    ]
+    metrics = {
+        "model": ranking_metrics(ranking, gt, candidates),
+        "gnn": ranking_metrics(gnn, gt, candidates),
+        "reference": ranking_metrics(reference, gt, candidates),
+        "oracle": ranking_metrics(ideal, gt, candidates),
+    }
+    scores = {
+        key: stage_score(value, metrics["reference"], len(reachable_set), stage)
+        for key, value in metrics.items()
+    }
+    delta = scores["model"] - scores["gnn"]
+    ceiling = bool(
+        valid
+        and reachable_set
+        and math.isclose(scores["model"], scores["oracle"], abs_tol=1e-12, rel_tol=0.0)
+    )
+    quality = 1.0 if ceiling else delta
+    # Invalid/short answers retain the observed ranking diagnostics, but cannot
+    # win a perfect-ranking bonus or gain from dropping most required names.
+    if not valid:
+        quality = min(0.0, quality)
+    format_score = float(valid)
+    penalty = min(1.0, 0.03 * (invalid + duplicates + shortfall))
+    if not parse_ok:
+        penalty = max(penalty, 0.1)
+    format_weight = float(kwargs.get("format_weight", 0.1))
+    if not 0 <= format_weight <= 0.2:
+        raise ValueError("format_weight must be in [0, 0.2]")
+    # Unlike the old negative-only scaling, this monotone transform cannot
+    # reverse lexicographic preferences between two complete legal answers.
+    reward = quality + format_weight * format_score - penalty
+    result = {
+        "score": reward,
+        "quality_reward": quality,
+        "rank_score": scores["model"],
+        "gnn_rank_score": scores["gnn"],
+        "reference_rank_score": scores["reference"],
+        "oracle_rank_score": scores["oracle"],
+        "rank_delta": delta,
+        "format_score": format_score,
+        "format_penalty": penalty,
+        "valid_output": float(valid),
+        "ceiling_reached": float(ceiling),
+        "gnn_at_ceiling": float(
+            bool(reachable_set)
+            and math.isclose(
+                scores["gnn"], scores["oracle"], abs_tol=1e-12, rel_tol=0.0
+            )
+        ),
+        "reachable_gt_count": float(len(reachable_set)),
+        "no_reachable_gt": float(not reachable_set),
+        "duplicate_name_count": float(duplicates),
+        "invalid_name_count": float(invalid),
+        "shortfall_count": float(shortfall),
+        "output_count": float(len(unique)),
+        "think_chars": float(think_chars),
+        "think_over_budget": float(think_chars > 200),
+        "training_stage": float(STAGES.index(stage) + 1),
+    }
+    for k in CUTOFFS:
+        for key in ("hits", "precision", "recall", "f1", "ndcg"):
+            for prefix, values in metrics.items():
+                result[f"{prefix}_{key}_{k}"] = values[f"{key}_{k}"]
+            result[f"{key}_{k}"] = metrics["model"][f"{key}_{k}"]
+            result[f"delta_{key}_{k}"] = (
+                metrics["model"][f"{key}_{k}"] - metrics["gnn"][f"{key}_{k}"]
+            )
+        result[f"reference_deficit_{k}"] = max(
+            0.0, metrics["reference"][f"hits_{k}"] - metrics["model"][f"hits_{k}"]
+        )
+    return result

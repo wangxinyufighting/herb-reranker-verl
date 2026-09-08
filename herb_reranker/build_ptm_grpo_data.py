@@ -33,6 +33,7 @@ class BuildStats:
     reachable_ground_truth_count: int = 0
     macro_candidate_recall: float = 0.0
     micro_candidate_recall: float = 0.0
+    alignment_mode: str = ""
 
 
 def load_herb_mapping(path: Path) -> dict[int, str]:
@@ -49,7 +50,9 @@ def load_herb_mapping(path: Path) -> dict[int, str]:
                 name, raw_id = text.rsplit(maxsplit=1)
                 herb_id = int(raw_id)
             except (ValueError, TypeError) as exc:
-                raise ValueError(f"{path} 第 {line_no} 行不是合法的“药名 ID”格式") from exc
+                raise ValueError(
+                    f"{path} 第 {line_no} 行不是合法的“药名 ID”格式"
+                ) from exc
             if herb_id in mapping:
                 raise ValueError(f"{path} 第 {line_no} 行出现重复中药 ID: {herb_id}")
             if name in seen_names:
@@ -131,7 +134,7 @@ def merge_to_jsonl(
     output_path = output_jsonl
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    stats = BuildStats(candidate_k=candidate_k)
+    stats = BuildStats(candidate_k=candidate_k, alignment_mode="symptom_ids_by_row")
     macro_recalls: list[float] = []
 
     context_iter = iter_context_rows(context_jsonl)
@@ -157,7 +160,9 @@ def merge_to_jsonl(
             try:
                 context_symptom_ids = [int(item) for item in raw_context_symptom_ids]
             except (TypeError, ValueError) as exc:
-                raise ValueError(f"上下文第 {context_line} 行含非整数 symptom_ids") from exc
+                raise ValueError(
+                    f"上下文第 {context_line} 行含非整数 symptom_ids"
+                ) from exc
             if context_symptom_ids != retrieval_symptom_ids:
                 raise ValueError(
                     "症状 ID 对齐失败："
@@ -171,7 +176,9 @@ def merge_to_jsonl(
                     f"少于 candidate_k={candidate_k}"
                 )
             selected_ids = candidate_ids[:candidate_k]
-            unknown_ids = [herb_id for herb_id in selected_ids if herb_id not in herb_mapping]
+            unknown_ids = [
+                herb_id for herb_id in selected_ids if herb_id not in herb_mapping
+            ]
             if unknown_ids:
                 raise ValueError(
                     f"GNN 第 {retrieval_line} 行含未映射的中药 ID: {unknown_ids[:10]}"
@@ -179,7 +186,9 @@ def merge_to_jsonl(
             candidate_herbs = [herb_mapping[herb_id] for herb_id in selected_ids]
 
             symptoms = _required_string_list(context, "symptoms", context_line)
-            ground_truth = _required_string_list(context, "ground_truth_herbs", context_line)
+            ground_truth = _required_string_list(
+                context, "ground_truth_herbs", context_line
+            )
             description = context.get("symptom_description")
             sample_id = context.get("sample_id")
             if not isinstance(description, str) or not description.strip():
@@ -195,7 +204,9 @@ def merge_to_jsonl(
 
             if reachable_count == 0:
                 if unreachable_policy == "error":
-                    raise ValueError(f"样本 {sample_id} 的 Top-{candidate_k} 与 GT 无交集")
+                    raise ValueError(
+                        f"样本 {sample_id} 的 Top-{candidate_k} 与 GT 无交集"
+                    )
                 if unreachable_policy == "drop":
                     stats.dropped_unreachable_rows += 1
                     continue
@@ -223,54 +234,150 @@ def merge_to_jsonl(
     return stats
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--context-jsonl", type=Path, required=True)
-    parser.add_argument("--retrieval-file", type=Path, required=True)
-    parser.add_argument("--herb-mapping", type=Path, required=True)
-    parser.add_argument("--output-jsonl", type=Path, required=True)
-    parser.add_argument("--output-parquet", type=Path, required=True)
-    parser.add_argument(
-        "--candidate-k",
-        type=int,
-        default=50,
-        help="从 GNN 有序列表头部选取多少味药；默认 50，可设为 200",
+def get_candidate_herbs(candidates_file: Path, can_num: int) -> dict[str, list[str]]:
+    """Read symptom-name<TAB>candidate-name lists without last-row-wins joins."""
+    mapping = {}
+    for number, line in enumerate(
+        Path(candidates_file).read_text(encoding="utf-8").splitlines(), 1
+    ):
+        fields = line.split("\t")
+        if len(fields) != 2:
+            raise ValueError(f"{candidates_file}:{number}: 需要一个制表符")
+        key = " ".join(fields[0].split())
+        herbs = fields[1].split()[:can_num]
+        if not key or len(herbs) < can_num or len(herbs) != len(set(herbs)):
+            raise ValueError(f"{candidates_file}:{number}: 症状或候选列表无效")
+        if key in mapping and mapping[key] != herbs:
+            raise ValueError(f"{candidates_file}:{number}: 相同症状存在冲突候选顺序")
+        mapping[key] = herbs
+    return mapping
+
+
+def merge_names_to_jsonl(
+    context_jsonl: Path,
+    candidates_file: Path,
+    output_jsonl: Path,
+    candidate_k: int = 50,
+    unreachable_policy: str = "drop",
+) -> BuildStats:
+    """Keep each original-description case, even when normalized symptoms match."""
+    if candidate_k <= 0 or unreachable_policy not in {"drop", "keep", "error"}:
+        raise ValueError("无效的数据构建参数")
+    contexts = list(iter_context_rows(context_jsonl))
+    entries = []
+    for number, line in enumerate(
+        candidates_file.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        fields = line.split("\t")
+        if len(fields) != 2:
+            raise ValueError(f"{candidates_file}:{number}: 需要一个制表符")
+        key, herbs = " ".join(fields[0].split()), fields[1].split()[:candidate_k]
+        if not key or len(herbs) < candidate_k or len(herbs) != len(set(herbs)):
+            raise ValueError(f"{candidates_file}:{number}: 症状或候选列表无效")
+        entries.append((key, herbs))
+    by_row = len(entries) == len(contexts)
+    mapping = {} if by_row else get_candidate_herbs(candidates_file, candidate_k)
+    stats = BuildStats(
+        candidate_k=candidate_k,
+        alignment_mode="symptom_names_by_row" if by_row else "unique_symptom_lookup",
     )
-    parser.add_argument(
-        "--unreachable-policy",
-        choices=("drop", "keep", "error"),
-        default="drop",
-        help="候选集与 GT 无交集时：丢弃、保留或报错",
+    rows, recalls, seen = [], [], set()
+    for index, (number, context) in enumerate(contexts):
+        symptoms = _required_string_list(context, "symptoms", number)
+        gt = _required_string_list(context, "ground_truth_herbs", number)
+        key = " ".join(symptoms)
+        if by_row and entries[index][0] != key:
+            raise ValueError(f"上下文第 {number} 行与候选文件的症状名称对齐失败")
+        if not by_row and key not in mapping:
+            raise ValueError(f"上下文第 {number} 行没有匹配的候选列表: {key}")
+        sample_id = context.get("sample_id")
+        description = context.get("symptom_description")
+        if not isinstance(sample_id, str) or not sample_id.strip() or sample_id in seen:
+            raise ValueError(f"上下文第 {number} 行 sample_id 缺失或重复")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError(f"上下文第 {number} 行缺少 symptom_description")
+        seen.add(sample_id)
+        candidates = entries[index][1] if by_row else mapping[key]
+        reachable = len(set(gt) & set(candidates))
+        stats.input_rows += 1
+        stats.ground_truth_count += len(set(gt))
+        stats.reachable_ground_truth_count += reachable
+        recalls.append(reachable / len(set(gt)))
+        if not reachable and unreachable_policy == "error":
+            raise ValueError(f"{sample_id}: 候选集与 GT 无交集")
+        if not reachable and unreachable_policy == "drop":
+            stats.dropped_unreachable_rows += 1
+            continue
+        rows.append(
+            {
+                "sample_id": sample_id.strip(),
+                "symptoms": symptoms,
+                "symptom_description": description.strip(),
+                "candidate_herbs": candidates,
+                "ground_truth_herbs": gt,
+            }
+        )
+    if not rows:
+        raise ValueError("对齐后没有可写入样本")
+    output_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    with output_jsonl.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    stats.written_rows = len(rows)
+    stats.micro_candidate_recall = (
+        stats.reachable_ground_truth_count / stats.ground_truth_count
     )
-    parser.add_argument(
-        "--output-k",
-        type=int,
-        default=20,
-        help="模型需要输出的候选数量；默认 20",
-    )
-    return parser.parse_args()
+    stats.macro_candidate_recall = sum(recalls) / len(recalls)
+    return stats
 
 
 def main() -> None:
-    args = parse_args()
-    stats = merge_to_jsonl(
-        context_jsonl=args.context_jsonl,
-        retrieval_file=args.retrieval_file,
-        herb_mapping_file=args.herb_mapping,
-        output_jsonl=args.output_jsonl,
-        candidate_k=args.candidate_k,
-        unreachable_policy=args.unreachable_policy,
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--context-jsonl", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--retrieval-file", type=Path)
+    source.add_argument("--candidate-names-file", type=Path)
+    parser.add_argument("--herb-mapping", type=Path)
+    parser.add_argument("--output-jsonl", type=Path, required=True)
+    parser.add_argument("--output-parquet", type=Path, required=True)
+    parser.add_argument("--candidate-k", type=int, default=50)
+    parser.add_argument("--output-k", type=int, default=20)
+    parser.add_argument(
+        "--unreachable-policy", choices=("drop", "keep", "error"), default="drop"
     )
-    print("数据对齐统计：")
+    parser.add_argument(
+        "--training-stage", choices=("stage1", "stage2", "stage3"), default="stage1"
+    )
+    parser.add_argument("--reference-jsonl", type=Path)
+    args = parser.parse_args()
+    if args.candidate_names_file:
+        stats = merge_names_to_jsonl(
+            args.context_jsonl,
+            args.candidate_names_file,
+            args.output_jsonl,
+            args.candidate_k,
+            args.unreachable_policy,
+        )
+    else:
+        if args.herb_mapping is None:
+            parser.error("--retrieval-file 需要 --herb-mapping")
+        stats = merge_to_jsonl(
+            args.context_jsonl,
+            args.retrieval_file,
+            args.herb_mapping,
+            args.output_jsonl,
+            args.candidate_k,
+            args.unreachable_policy,
+        )
     print(json.dumps(asdict(stats), ensure_ascii=False, indent=2))
-
-    # 无交集样本已在 merge_to_jsonl 中按策略处理；这里保持 JSONL 与 Parquet 行数一致。
     convert_jsonl(
-        input_path=args.output_jsonl,
-        output_path=args.output_parquet,
-        min_candidates=args.candidate_k,
-        unreachable_policy="keep",
-        output_k=args.output_k,
+        args.output_jsonl,
+        args.output_parquet,
+        args.candidate_k,
+        "keep",
+        args.output_k,
+        args.training_stage,
+        args.reference_jsonl,
     )
 
 

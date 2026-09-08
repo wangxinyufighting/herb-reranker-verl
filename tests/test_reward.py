@@ -1,230 +1,178 @@
-"""奖励函数的关键边界测试。"""
+"""Name protocol, legacy metrics, and progressive ordering tests."""
 
-from __future__ import annotations
-
-import json
 import math
 import unittest
 
 from herb_reranker.reward import (
-    competence_gate,
+    batch_test_ndcg,
     compute_score,
-    fixed_joint_rank_reward,
-    hierarchical_rank_reward,
-    relative_improvement_reward,
+    ranking_metrics,
+    stage_score,
 )
 
-
-CANDIDATES = [f"药{i}" for i in range(1, 51)]
-GROUND_TRUTH = {"ground_truth_herbs": ["药2", "药4", "药40", "候选外GT"]}
-EXTRA_INFO = {
-    "candidate_herbs": CANDIDATES,
-    "gnn_candidate_herbs": CANDIDATES,
-    "output_k": 20,
-}
-COPY_RANKING = list(range(1, 21))
-ORACLE_RANKING = [2, 4, 40] + [
-    index for index in range(1, 51) if index not in {2, 4, 40}
-][:17]
-POOR_RANKING = [
-    index for index in range(1, 51) if index not in {2, 4, 40}
-][:20]
+C = [f"药{i}" for i in range(50)]
+GT = {"candidate_herbs": C, "gt_herbs": [C[1], C[3], C[40], "候选外GT"]}
+COPY = C[:20]
+ORACLE = [C[1], C[3], C[40]] + [h for h in C if h not in GT["gt_herbs"]][:17]
+POOR = [h for h in C if h not in GT["gt_herbs"]][:20]
 
 
-def output(ranking: list[object]) -> str:
-    return json.dumps({"ranking": ranking}, ensure_ascii=False)
-
-
-class HierarchicalRewardTest(unittest.TestCase):
-    def test_formula(self) -> None:
-        gate_5 = 0.1 + 0.9 * 0.2
-        gate_10 = 0.1 + 0.9 * 0.4
-        expected = (0.2 + gate_5 * 0.4 + gate_5 * gate_10 * 0.6) / 3.0
-        self.assertAlmostEqual(hierarchical_rank_reward(0.2, 0.4, 0.6), expected)
-
-    def test_perfect_ranking_reaches_one(self) -> None:
-        self.assertAlmostEqual(hierarchical_rank_reward(1.0, 1.0, 1.0), 1.0)
-
-    def test_epsilon_avoids_zero_reward_dead_zone(self) -> None:
-        self.assertEqual(competence_gate(0.0, epsilon=0.1), 0.1)
-        self.assertGreater(hierarchical_rank_reward(0.0, 0.5, 0.6), 0.0)
-
-    def test_fixed_joint_reward(self) -> None:
-        expected = 0.4 * 0.2 + 0.3 * 0.4 + 0.3 * 0.6
-        self.assertAlmostEqual(fixed_joint_rank_reward(0.2, 0.4, 0.6), expected)
-
-    def test_relative_improvement_is_zero_centered(self) -> None:
-        self.assertEqual(relative_improvement_reward(0.4, 0.4), 0.0)
-        self.assertAlmostEqual(relative_improvement_reward(1.0, 0.4), 1.0)
-        self.assertAlmostEqual(relative_improvement_reward(0.0, 0.4), -1.0)
-        self.assertGreater(relative_improvement_reward(0.6, 0.4), 0.0)
-        self.assertLess(relative_improvement_reward(0.2, 0.4), 0.0)
+def answer(ranking):
+    return "<think>简洁说明</think><answer>" + ">".join(ranking) + "</answer>"
 
 
 class RewardTest(unittest.TestCase):
-    def score(self, solution: str, hierarchical: bool = True) -> dict[str, float]:
-        return compute_score(
-            data_source="ptm_herb_rerank",
-            solution_str=solution,
-            ground_truth=GROUND_TRUTH,
-            extra_info=EXTRA_INFO,
-            use_hierarchical_reward=hierarchical,
+    def score(self, ranking, stage="stage1", reference=None, gt=GT):
+        info = {"candidate_herbs": C, "output_k": 20, "training_stage": stage}
+        if reference is not None:
+            info["reference_ranking"] = reference
+        return compute_score("test", answer(ranking), gt, info)
+
+    def test_old_and_verl_call_signatures(self):
+        old = compute_score(answer(COPY), GT, data_source="test")
+        new = compute_score(
+            data_source="test", solution_str=answer(COPY), ground_truth=GT
         )
+        self.assertEqual(old, new)
+        self.assertEqual(compute_score(answer(COPY), GT, "test"), new)
 
-    def test_copy_is_valid_but_has_zero_quality_improvement(self) -> None:
-        result = self.score(output(COPY_RANKING))
-        self.assertEqual(result["valid_output"], 1.0)
-        self.assertEqual(result["exact_topk"], 1.0)
-        self.assertEqual(result["exact_permutation"], 0.0)
-        self.assertAlmostEqual(result["relative_improvement"], 0.0)
-        self.assertAlmostEqual(result["score"], 0.05)
-        for cutoff in (5, 10, 15, 20):
-            self.assertEqual(result[f"copy_ratio_{cutoff}"], 1.0)
-            self.assertEqual(result[f"exact_copy_{cutoff}"], 1.0)
+    def test_copy_gain_and_ceiling(self):
+        copied, good, bad = [self.score(r) for r in (COPY, ORACLE, POOR)]
+        self.assertEqual(copied["rank_delta"], 0)
+        self.assertEqual(copied["quality_reward"], 0)
+        self.assertGreater(good["score"], copied["score"])
+        self.assertGreater(copied["score"], bad["score"])
+        self.assertEqual(good["ceiling_reached"], 1)
+        self.assertEqual(good["quality_reward"], 1)
+        ceiling_copy = self.score(COPY, gt={"gt_herbs": [C[0], C[1]]})
+        self.assertEqual(ceiling_copy["quality_reward"], 1)
 
-    def test_better_copy_and_worse_rankings_are_ordered(self) -> None:
-        better = self.score(output(ORACLE_RANKING))
-        copied = self.score(output(COPY_RANKING))
-        worse = self.score(output(POOR_RANKING))
-        self.assertGreater(better["score"], copied["score"])
-        self.assertGreater(copied["score"], worse["score"])
-        self.assertGreater(better["relative_improvement"], 0.0)
-        self.assertLess(worse["relative_improvement"], 0.0)
-        self.assertGreater(better["anti_copy_bonus"], 0.0)
-        self.assertEqual(worse["anti_copy_bonus"], 0.0)
+    def test_unreachable_is_not_a_perfect_ranking(self):
+        result = self.score(COPY, gt={"gt_herbs": ["候选外GT"]})
+        self.assertEqual(result["ceiling_reached"], 0)
+        self.assertEqual(result["quality_reward"], 0)
+        self.assertEqual(result["no_reachable_gt"], 1)
 
-    def test_gt_outside_candidates_does_not_change_reward_rank_score(self) -> None:
-        with_unreachable = self.score(output(ORACLE_RANKING))
-        without_unreachable = compute_score(
-            "ptm_herb_rerank",
-            output(ORACLE_RANKING),
-            {"ground_truth_herbs": ["药2", "药4", "药40"]},
-            EXTRA_INFO,
-            use_hierarchical_reward=True,
-        )
-        self.assertAlmostEqual(
-            with_unreachable["rank_score"], without_unreachable["rank_score"]
-        )
-        self.assertEqual(with_unreachable["reachable_gt_count"], 3.0)
+    def test_old_batch_test_ndcg_and_full_gt_recall(self):
+        result = self.score(COPY)
+        expected = (1 / math.log2(3) + 1 / math.log2(5)) / (1 + 1 / math.log2(3))
+        self.assertAlmostEqual(result["model_ndcg_5"], expected)
+        self.assertEqual(result["model_precision_5"], 2 / 5)
+        self.assertEqual(result["model_recall_5"], 2 / 4)
 
-    def test_reward_switch_changes_only_rank_aggregation(self) -> None:
-        hierarchical = self.score(output(ORACLE_RANKING), hierarchical=True)
-        fixed = self.score(output(ORACLE_RANKING), hierarchical=False)
-        self.assertEqual(hierarchical["hierarchical_reward_enabled"], 1.0)
-        self.assertEqual(fixed["hierarchical_reward_enabled"], 0.0)
-        for key in (
-            "ndcg_5",
-            "ndcg_10",
-            "ndcg_15",
-            "ndcg_20",
-            "format_score",
-            "constraint_quality",
+    def test_old_ndcg_denominator_can_change_with_deeper_hits(self):
+        self.assertEqual(batch_test_ndcg([1, 0, 0, 0, 0, 0], 5), 1)
+        self.assertLess(batch_test_ndcg([1, 0, 0, 0, 0, 1], 5), 1)
+
+    def test_no_prefix_repair_or_invalid_perfect_bonus(self):
+        for ranking in (
+            ORACLE[:3],
+            ORACLE[:3] + ["非法药"] * 17,
+            ORACLE[:19] + [ORACLE[0]],
         ):
-            self.assertEqual(hierarchical[key], fixed[key])
-        self.assertNotEqual(hierarchical["gnn_rank_score"], fixed["gnn_rank_score"])
+            result = self.score(ranking)
+            self.assertEqual(result["valid_output"], 0)
+            self.assertEqual(result["ceiling_reached"], 0)
+            self.assertLess(result["score"], self.score(COPY)["score"])
+        partial = self.score([C[1]])
+        self.assertEqual(partial["model_hits_20"], 1)
 
-    def test_invalid_json_is_below_every_valid_ranking(self) -> None:
-        invalid = self.score("药1、药2、药3")
-        worst_valid = self.score(output(POOR_RANKING))
-        self.assertLess(invalid["score"], worst_valid["score"])
-        self.assertEqual(invalid["format_score"], 0.0)
-        self.assertEqual(invalid["valid_output"], 0.0)
+    def test_extra_valid_names_allowed_like_old_minimum_length(self):
+        self.assertEqual(self.score(C)["valid_output"], 1)
 
-    def test_missing_candidates_is_invalid(self) -> None:
-        full = self.score(output(COPY_RANKING))
-        partial = self.score(output(COPY_RANKING[:5]))
-        self.assertLess(partial["score"], full["score"])
-        self.assertAlmostEqual(partial["required_output_coverage"], 0.25)
-        self.assertAlmostEqual(partial["candidate_coverage"], 0.10)
-        self.assertEqual(partial["missing_index_count"], 15.0)
-        self.assertEqual(partial["valid_output"], 0.0)
+    def test_ids_and_multiple_answer_blocks_rejected(self):
+        for text in (
+            '{"ranking":[1,2,3]}',
+            answer(COPY) + answer(ORACLE),
+            "<answer></answer>",
+        ):
+            result = compute_score(text, GT)
+            self.assertEqual(result["valid_output"], 0)
+            self.assertEqual(result["ceiling_reached"], 0)
 
-    def test_duplicate_and_out_of_candidate_are_invalid(self) -> None:
-        malformed = COPY_RANKING[:-2] + [1, 51]
-        result = self.score(output(malformed))
-        self.assertEqual(result["valid_output"], 0.0)
-        self.assertEqual(result["duplicate_index_count"], 1.0)
-        self.assertEqual(result["invalid_index_count"], 1.0)
-        self.assertEqual(result["missing_index_count"], 2.0)
+    def test_stale_id_data_rejected(self):
+        with self.assertRaisesRegex(ValueError, "rebuilt"):
+            compute_score("test", answer(COPY), GT, {"candidate_id_scheme": "old"})
 
-    def test_more_than_output_k_is_invalid(self) -> None:
-        result = self.score(output(list(range(1, 22))))
-        self.assertEqual(result["valid_output"], 0.0)
-        self.assertEqual(result["extra_index_count"], 1.0)
+    def test_stage2_requires_frozen_reference(self):
+        with self.assertRaisesRegex(ValueError, "reference_ranking"):
+            self.score(COPY, "stage2")
+        with self.assertRaisesRegex(ValueError, "reference_ranking"):
+            self.score(COPY, "stage2", ORACLE[:3])
+        result = self.score(COPY, "stage2", ORACLE)
+        self.assertEqual(result["reference_deficit_5"], 1)
+        self.assertEqual(result["reference_hits_5"], 3)
 
-    def test_string_indices_are_rejected(self) -> None:
-        result = self.score(output([str(index) for index in COPY_RANKING]))
-        self.assertEqual(result["required_output_coverage"], 0.0)
-        self.assertEqual(result["invalid_index_count"], 20.0)
-        self.assertEqual(result["valid_output"], 0.0)
+    def test_stage_mismatch_fails(self):
+        with self.assertRaisesRegex(ValueError, "stage"):
+            compute_score(
+                "test",
+                answer(COPY),
+                GT,
+                {"training_stage": "stage2"},
+                training_stage="stage1",
+            )
 
-    def test_qwen_think_wrapper_can_be_parsed(self) -> None:
-        wrapped = "<think>内部思考</think>\n```json\n" + output(COPY_RANKING) + "\n```"
-        result = self.score(wrapped)
-        self.assertEqual(result["valid_output"], 1.0)
-        self.assertAlmostEqual(result["score"], 0.05)
+    def test_candidate_external_gt_cannot_be_credited(self):
+        ranking = ["候选外GT"] + POOR[:19]
+        self.assertEqual(self.score(ranking)["model_hits_20"], 0)
 
-    def test_separate_id_and_gnn_orders(self) -> None:
-        # ID 1/2/3 分别指向药3/药1/药2；GNN baseline 仍是药1/药2/药3。
-        result = compute_score(
-            data_source="ptm_herb_rerank",
-            solution_str=output([2, 3]),
-            ground_truth={"ground_truth_herbs": ["药1", "药2"]},
-            extra_info={
-                "candidate_herbs": ["药3", "药1", "药2"],
-                "gnn_candidate_herbs": ["药1", "药2", "药3"],
-                "output_k": 2,
-            },
+    def test_metrics_dedup_before_cutoff(self):
+        metrics = ranking_metrics([C[1], C[1], C[3]], GT["gt_herbs"], C)
+        self.assertEqual(metrics["hits_5"], 2)
+
+    def test_no_nan(self):
+        for stage in ("stage1", "stage2", "stage3"):
+            result = self.score(ORACLE, stage, ORACLE)
+            self.assertTrue(all(math.isfinite(value) for value in result.values()))
+
+
+class LexicographicTest(unittest.TestCase):
+    def metrics(self, h5, h10, h20, n):
+        return {
+            "hits_5": h5,
+            "hits_10": h10,
+            "hits_20": h20,
+            "ndcg_5": n,
+            "ndcg_10": n,
+            "ndcg_20": n,
+        }
+
+    def test_one_hit_always_dominates_ndcg(self):
+        ref = self.metrics(0, 0, 0, 0)
+        for hits in range(5):
+            better = self.metrics(hits + 1, 10, 20, 0)
+            worse = self.metrics(hits, 10, 20, 1)
+            self.assertGreater(
+                stage_score(better, ref, 20, "stage1"),
+                stage_score(worse, ref, 20, "stage1"),
+            )
+
+    def test_stage2_head_floor_dominates_all_top10_gain(self):
+        ref = self.metrics(5, 5, 5, 0)
+        maintained = self.metrics(5, 5, 5, 0)
+        regression = self.metrics(4, 10, 20, 1)
+        self.assertGreater(
+            stage_score(maintained, ref, 20, "stage2"),
+            stage_score(regression, ref, 20, "stage2"),
         )
-        self.assertEqual(result["copy_ratio_output"], 1.0)
-        self.assertAlmostEqual(result["relative_improvement"], 0.0)
 
-    def test_model_gnn_and_delta_metrics(self) -> None:
-        result = self.score(output(COPY_RANKING))
-        for cutoff in (5, 10, 15, 20):
-            for metric in ("precision", "recall", "ndcg"):
-                self.assertAlmostEqual(
-                    result[f"delta_{metric}_{cutoff}"],
-                    result[f"model_{metric}_{cutoff}"]
-                    - result[f"gnn_{metric}_{cutoff}"],
-                )
-                self.assertAlmostEqual(
-                    result[f"headroom_{metric}_{cutoff}"],
-                    result[f"oracle_{metric}_{cutoff}"]
-                    - result[f"gnn_{metric}_{cutoff}"],
-                )
+    def test_stage2_top10_improves_after_floor_is_met(self):
+        ref = self.metrics(3, 5, 5, 0)
+        low = self.metrics(3, 5, 5, 1)
+        high = self.metrics(3, 6, 6, 0)
+        self.assertGreater(
+            stage_score(high, ref, 20, "stage2"), stage_score(low, ref, 20, "stage2")
+        )
 
-        self.assertAlmostEqual(result["model_precision_5"], 2 / 5)
-        # Recall 使用完整 GT 作分母，候选集未召回的 GT 仍计入分母。
-        self.assertAlmostEqual(result["model_recall_5"], 2 / 4)
-        expected_ndcg = (
-            1.0 / math.log2(3) + 1.0 / math.log2(5)
-        ) / sum(1.0 / math.log2(rank + 1) for rank in range(1, 5))
-        self.assertAlmostEqual(result["model_ndcg_5"], expected_ndcg)
-        self.assertEqual(result["delta_ndcg_5"], 0.0)
-
-    def test_invalid_output_does_not_inherit_gnn_metrics(self) -> None:
-        result = self.score("非法输出")
-        self.assertEqual(result["model_ndcg_5"], 0.0)
-        self.assertGreater(result["gnn_ndcg_5"], 0.0)
-        self.assertAlmostEqual(result["delta_ndcg_5"], -result["gnn_ndcg_5"])
-
-    def test_oracle_exposes_retriever_headroom(self) -> None:
-        result = self.score(output(ORACLE_RANKING))
-        for cutoff in (5, 10, 15, 20):
-            for metric in ("precision", "recall", "ndcg"):
-                self.assertAlmostEqual(
-                    result[f"model_{metric}_{cutoff}"],
-                    result[f"oracle_{metric}_{cutoff}"],
-                )
-                self.assertAlmostEqual(
-                    result[f"delta_{metric}_{cutoff}"],
-                    result[f"headroom_{metric}_{cutoff}"],
-                )
-                self.assertAlmostEqual(result[f"remaining_gap_{metric}_{cutoff}"], 0.0)
-
-        self.assertGreater(result["rank_delta"], 0.0)
-        self.assertLess(result["copy_ratio_20"], 1.0)
+    def test_stage3_both_head_floors_dominate_top20(self):
+        ref = self.metrics(5, 10, 10, 0)
+        good = self.metrics(5, 10, 10, 0)
+        for bad in (self.metrics(4, 10, 20, 1), self.metrics(5, 9, 20, 1)):
+            self.assertGreater(
+                stage_score(good, ref, 20, "stage3"),
+                stage_score(bad, ref, 20, "stage3"),
+            )
 
 
 if __name__ == "__main__":
