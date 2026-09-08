@@ -119,7 +119,10 @@ class PipelineTest(unittest.TestCase):
 
     def test_name_join_preserves_cases_and_rejects_conflicting_candidates(self):
         source = self.root / "names.txt"
-        source.write_text("same\t" + " ".join(self.herbs) + "\n")
+        source.write_text(
+            "same\t" + " ".join(self.herbs) + "\n"
+            "same\t" + " ".join(self.herbs) + "\n"
+        )
         output = self.root / "merged.jsonl"
         stats = merge_names_to_jsonl(
             self.data, source, output, unreachable_policy="keep"
@@ -130,7 +133,8 @@ class PipelineTest(unittest.TestCase):
             read_jsonl(output)[1]["symptom_description"],
         )
         source.write_text(
-            source.read_text() + "same\t" + " ".join(reversed(self.herbs)) + "\n"
+            "same\t" + " ".join(self.herbs) + "\n"
+            "same\t" + " ".join(reversed(self.herbs)) + "\n"
         )
         merge_names_to_jsonl(self.data, source, output, unreachable_policy="keep")
         self.assertNotEqual(
@@ -140,6 +144,41 @@ class PipelineTest(unittest.TestCase):
         source.write_text(source.read_text() + "same\t" + " ".join(self.herbs) + "\n")
         with self.assertRaisesRegex(ValueError, "冲突"):
             merge_names_to_jsonl(self.data, source, output)
+
+    def test_filtered_candidate_subsequence_preserves_duplicate_cases(self):
+        source = self.root / "names.txt"
+        first = "same\t" + " ".join(self.herbs)
+        second = "same\t" + " ".join(reversed(self.herbs))
+        source.write_text(first + "\n" + second + "\n")
+        missing = dict(self.rows[0], sample_id="missing", symptoms=["missing"])
+        last = dict(self.rows[1], ground_truth_herbs=["h1"])
+        self.write(self.data, [self.rows[0], missing, last])
+        output = self.root / "merged.jsonl"
+        stats = merge_names_to_jsonl(self.data, source, output)
+        self.assertEqual(stats.input_rows, 3)
+        self.assertEqual(stats.written_rows, 2)
+        self.assertEqual(stats.dropped_missing_candidate_rows, 1)
+        self.assertEqual(stats.alignment_mode, "symptom_names_subsequence")
+        self.assertEqual([row["sample_id"] for row in read_jsonl(output)], ["0", "1"])
+        self.assertEqual(
+            read_jsonl(output)[1]["candidate_herbs"], list(reversed(self.herbs))
+        )
+        with self.assertRaisesRegex(ValueError, "缺少"):
+            merge_names_to_jsonl(self.data, source, output, unreachable_policy="keep")
+
+    def test_partial_missing_duplicate_case_is_not_guessed(self):
+        source = self.root / "names.txt"
+        source.write_text(
+            "same\t"
+            + " ".join(self.herbs)
+            + "\n"
+            + "same\t"
+            + " ".join(reversed(self.herbs))
+            + "\n"
+        )
+        self.write(self.data, self.rows + [dict(self.rows[0], sample_id="third")])
+        with self.assertRaisesRegex(ValueError, "冲突"):
+            merge_names_to_jsonl(self.data, source, self.root / "merged.jsonl")
 
     def test_predict_sends_no_gt_and_exports_fingerprint(self):
         sent = []

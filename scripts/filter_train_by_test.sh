@@ -7,8 +7,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CANDIDATE_K="${CANDIDATE_K:-50}"
+TRAINING_STAGE="${TRAINING_STAGE:-stage1}"
+STAGE_DIR="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}"
 if [[ -n "${TRAIN_PARQUET:-}" ]]; then
   TRAIN_PARQUET="${TRAIN_PARQUET}"
+elif [[ -f "${STAGE_DIR}/train_top${CANDIDATE_K}.parquet" ]]; then
+  TRAIN_PARQUET="${STAGE_DIR}/train_top${CANDIDATE_K}.parquet"
+elif [[ -f "${STAGE_DIR}/train.parquet" ]]; then
+  TRAIN_PARQUET="${STAGE_DIR}/train.parquet"
 elif [[ -f "${PROJECT_ROOT}/data/processed/train_top${CANDIDATE_K}.parquet" ]]; then
   TRAIN_PARQUET="${PROJECT_ROOT}/data/processed/train_top${CANDIDATE_K}.parquet"
 else
@@ -16,6 +22,8 @@ else
 fi
 if [[ -n "${TEST_PARQUET:-}" ]]; then
   TEST_PARQUET="${TEST_PARQUET}"
+elif [[ -f "${PROJECT_ROOT}/data/processed/stage1/test_top${CANDIDATE_K}.parquet" ]]; then
+  TEST_PARQUET="${PROJECT_ROOT}/data/processed/stage1/test_top${CANDIDATE_K}.parquet"
 elif [[ -f "${PROJECT_ROOT}/data/processed/test_top${CANDIDATE_K}.parquet" ]]; then
   TEST_PARQUET="${PROJECT_ROOT}/data/processed/test_top${CANDIDATE_K}.parquet"
 else
@@ -25,8 +33,8 @@ FILTER_MODE="${FILTER_MODE:-matched}"
 TRAIN_PER_TEST="${TRAIN_PER_TEST:-2}"
 FILTER_SEED="${FILTER_SEED:-42}"
 NEAREST_FALLBACK="${NEAREST_FALLBACK:-on}"
-OUTPUT_PARQUET="${OUTPUT_PARQUET:-${PROJECT_ROOT}/data/processed/train_top${CANDIDATE_K}_test_${FILTER_MODE}.parquet}"
-REPORT_PATH="${REPORT_PATH:-${PROJECT_ROOT}/data/processed/train_top${CANDIDATE_K}_test_${FILTER_MODE}.report.json}"
+OUTPUT_PARQUET="${OUTPUT_PARQUET:-${STAGE_DIR}/train_top${CANDIDATE_K}_test_${FILTER_MODE}.parquet}"
+REPORT_PATH="${REPORT_PATH:-${STAGE_DIR}/train_top${CANDIDATE_K}_test_${FILTER_MODE}.report.json}"
 
 if [[ ! -f "${TRAIN_PARQUET}" ]]; then
   echo "训练文件不存在: ${TRAIN_PARQUET}" >&2
@@ -64,4 +72,4 @@ python3 -m herb_reranker.filter_train_by_test \
 
 echo
 echo "训练时使用："
-echo "TRAIN_FILES=${OUTPUT_PARQUET} bash scripts/train.sh"
+echo "TRAINING_STAGE=${TRAINING_STAGE} TRAIN_FILES=${OUTPUT_PARQUET} bash scripts/train.sh"

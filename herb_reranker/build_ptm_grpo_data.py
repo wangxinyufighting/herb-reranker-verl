@@ -282,20 +282,25 @@ def merge_names_to_jsonl(
     # order; a symptom dictionary would silently swap tied cases.
     assignments: list[list[str] | None] = []
     cursor = 0
-    for _, context in contexts:
-        key = " ".join(_required_string_list(context, "symptoms", 0))
+    for number, context in contexts:
+        key = " ".join(_required_string_list(context, "symptoms", number))
         if cursor < len(entries) and entries[cursor][0] == key:
             assignments.append(entries[cursor][1])
             cursor += 1
         else:
             assignments.append(None)
-    if cursor == len(entries):
+    known_keys = {key for key, _ in entries}
+    ambiguous_skips = any(
+        assigned is None and " ".join(context["symptoms"]) in known_keys
+        for (_, context), assigned in zip(contexts, assignments)
+    )
+    if cursor == len(entries) and not ambiguous_skips:
         alignment_mode = "symptom_names_subsequence"
     else:
         mapping = get_candidate_herbs(candidates_file, candidate_k)
         assignments = [
-            mapping.get(" ".join(_required_string_list(context, "symptoms", 0)))
-            for _, context in contexts
+            mapping.get(" ".join(_required_string_list(context, "symptoms", number)))
+            for number, context in contexts
         ]
         alignment_mode = "unique_symptom_lookup"
     stats = BuildStats(
@@ -320,7 +325,7 @@ def merge_names_to_jsonl(
             stats.dropped_missing_candidate_rows += 1
             stats.ground_truth_count += len(set(gt))
             recalls.append(0.0)
-            if unreachable_policy == "error":
+            if unreachable_policy != "drop":
                 raise ValueError(f"{sample_id}: 缺少与症状对齐的候选列表")
             continue
         reachable = len(set(gt) & set(candidates))

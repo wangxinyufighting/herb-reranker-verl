@@ -60,8 +60,9 @@ bash scripts/build_test_parquet.sh
 
 默认输入为 `data/raw/{train,test}_with_context.jsonl` 和 `data/raw/{train,test}_candidate_name.txt`。候选文件每行是 `症状名称列表<TAB>有序药名列表`。
 
-- 两侧行数相同时严格逐行校验症状名称，保留逐病例候选顺序。
-- 行数不同时仅允许唯一且无冲突的症状到候选映射；相同症状有不同候选顺序会报错，不能用字典最后一条静默覆盖。
+- 优先按症状顺序做子序列对齐：候选文件可比上下文少一些病例，重复症状仍使用各自对应行的候选顺序，不再强行压成字典。
+- 若被跳过病例的症状在候选文件中也出现，则不能确定是哪次重复病例缺失；只有候选顺序无冲突时才允许按唯一症状映射回退，否则报错。
+- 训练缺少候选的病例单独计入 `dropped_missing_candidate_rows`；测试/验证使用 `keep` 时若缺候选会报错，不静默缩小评测集。
 - 可用 `RETRIEVAL_FILE=/path/gnn_ids.txt HERB_MAPPING=/path/herb_mapping.txt` 切换到旧 ID 文件输入；此模式严格逐行校验症状 ID，再把药材 ID 映射成药名。
 
 原始输入与候选文件不对齐时必须先修正来源，不能按行盲目拼接。相同症状的不同原始描述仍是独立病例。
@@ -83,6 +84,23 @@ python -m herb_reranker.prepare_data \
 ```
 
 划分只使用原始输入和固定 seed，相同输入组不跨训练/验证集。默认验证组比例为 10%，不按 GT 分层或筛选。数据中所有 `sample_id` 必须唯一。
+
+## 按测试症状筛选训练子集
+
+原来的筛选代码仍然保留：`herb_reranker/filter_train_by_test.py` 和 `scripts/filter_train_by_test.sh`。只使用测试输入的 `extra_info.symptoms` 决定选择，不使用测试 GT、reward、候选排序或上一阶段参考。
+
+```bash
+TRAINING_STAGE=stage1 FILTER_MODE=matched TRAIN_PER_TEST=2 \
+  bash scripts/filter_train_by_test.sh
+
+TRAINING_STAGE=stage1 \
+  TRAIN_FILES=data/processed/stage1/train_top50_test_matched.parquet \
+  MODEL_PATH=/path/base-model VERL_ROOT=/path/verl bash scripts/train.sh
+```
+
+默认 `matched` 按测试症状组合分配训练病例，缺少精确组合时可按 Jaccard 相似度兜底。`FILTER_MODE=exact` 只保留精确症状组合，`FILTER_MODE=overlap` 保留任一症状有交集的病例。`TRAIN_PARQUET`、`TEST_PARQUET`、`OUTPUT_PARQUET` 可显式覆盖路径；旧版非阶段目录仍可读取。筛选保留整行 Arrow schema，因此原始描述和 Stage 2/3 的参考不会丢失。
+
+这是使用测试输入分布的开发/传导式实验选项，不是默认的独立留出评测流程；正式比较应明确报告筛选协议，并同时报告完整训练集结果。不得用测试 GT 选择病例或 checkpoint。
 
 ## 逐阶段训练
 
