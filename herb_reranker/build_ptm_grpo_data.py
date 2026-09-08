@@ -34,6 +34,7 @@ class BuildStats:
     macro_candidate_recall: float = 0.0
     micro_candidate_recall: float = 0.0
     alignment_mode: str = ""
+    dropped_missing_candidate_rows: int = 0
 
 
 def load_herb_mapping(path: Path) -> dict[int, str]:
@@ -275,21 +276,38 @@ def merge_names_to_jsonl(
         if not key or len(herbs) < candidate_k or len(herbs) != len(set(herbs)):
             raise ValueError(f"{candidates_file}:{number}: 症状或候选列表无效")
         entries.append((key, herbs))
-    by_row = len(entries) == len(contexts)
-    mapping = {} if by_row else get_candidate_herbs(candidates_file, candidate_k)
+    # The name file is produced after filtering cases with no retrieval result,
+    # so its length can be smaller than the context file.  Align it as a
+    # subsequence, preserving duplicate symptom cases and their own candidate
+    # order; a symptom dictionary would silently swap tied cases.
+    assignments: list[list[str] | None] = []
+    cursor = 0
+    for _, context in contexts:
+        key = " ".join(_required_string_list(context, "symptoms", 0))
+        if cursor < len(entries) and entries[cursor][0] == key:
+            assignments.append(entries[cursor][1])
+            cursor += 1
+        else:
+            assignments.append(None)
+    if cursor == len(entries):
+        alignment_mode = "symptom_names_subsequence"
+    else:
+        mapping = get_candidate_herbs(candidates_file, candidate_k)
+        assignments = [
+            mapping.get(" ".join(_required_string_list(context, "symptoms", 0)))
+            for _, context in contexts
+        ]
+        alignment_mode = "unique_symptom_lookup"
     stats = BuildStats(
         candidate_k=candidate_k,
-        alignment_mode="symptom_names_by_row" if by_row else "unique_symptom_lookup",
+        alignment_mode=alignment_mode,
     )
     rows, recalls, seen = [], [], set()
     for index, (number, context) in enumerate(contexts):
         symptoms = _required_string_list(context, "symptoms", number)
         gt = _required_string_list(context, "ground_truth_herbs", number)
         key = " ".join(symptoms)
-        if by_row and entries[index][0] != key:
-            raise ValueError(f"上下文第 {number} 行与候选文件的症状名称对齐失败")
-        if not by_row and key not in mapping:
-            raise ValueError(f"上下文第 {number} 行没有匹配的候选列表: {key}")
+        candidates = assignments[index]
         sample_id = context.get("sample_id")
         description = context.get("symptom_description")
         if not isinstance(sample_id, str) or not sample_id.strip() or sample_id in seen:
@@ -297,9 +315,15 @@ def merge_names_to_jsonl(
         if not isinstance(description, str) or not description.strip():
             raise ValueError(f"上下文第 {number} 行缺少 symptom_description")
         seen.add(sample_id)
-        candidates = entries[index][1] if by_row else mapping[key]
-        reachable = len(set(gt) & set(candidates))
         stats.input_rows += 1
+        if candidates is None:
+            stats.dropped_missing_candidate_rows += 1
+            stats.ground_truth_count += len(set(gt))
+            recalls.append(0.0)
+            if unreachable_policy == "error":
+                raise ValueError(f"{sample_id}: 缺少与症状对齐的候选列表")
+            continue
+        reachable = len(set(gt) & set(candidates))
         stats.ground_truth_count += len(set(gt))
         stats.reachable_ground_truth_count += reachable
         recalls.append(reachable / len(set(gt)))
