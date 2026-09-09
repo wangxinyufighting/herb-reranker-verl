@@ -1,4 +1,9 @@
-"""验证 Parquet 的药名协议、阶段和冻结参考，拒绝静默混用旧 ID 数据。"""
+"""验证现有旧版 Parquet 或本项目新阶段 Parquet。
+
+旧版 ``train.parquet``/``test.parquet`` 已经是 VERL 可直接读取的格式，使用
+``reward_model.ground_truth`` 保存候选和 GT，不应被新的 ``extra_info`` 阶段协议
+误判为无效。默认 ``auto`` 按 schema 选择校验器。
+"""
 
 from __future__ import annotations
 
@@ -9,6 +14,7 @@ from typing import Any
 
 from .prepare_data import SYSTEM_PROMPT, build_user_prompt, input_fingerprint
 from .reward import PROTOCOL, STAGES, names, normalize_stage, validate_reference
+from .legacy_data import legacy_ground_truth, legacy_prompt
 
 
 def validate_protocol_row(
@@ -77,18 +83,65 @@ def validate_protocol_row(
         raise ValueError(f"{prefix}: Prompt 与药名协议不匹配")
 
 
+def validate_legacy_row(
+    row: Mapping[str, Any], source: Path, row_index: int
+) -> None:
+    """校验旧 reward 的输入契约，不改变旧 prompt 或 ground truth。"""
+
+    prefix = f"{source} 第 {row_index} 条"
+    legacy_prompt(row, prefix)
+    ground_truth = legacy_ground_truth(row, prefix)
+    candidates = ground_truth["candidate_herbs"]
+    gt = ground_truth["gt_herbs"]
+    if len(set(gt)) != len(gt):
+        raise ValueError(f"{prefix}: gt_herbs 含重复药名")
+    data_source = row.get("data_source")
+    if data_source is not None and (
+        not isinstance(data_source, str) or not data_source.strip()
+    ):
+        raise ValueError(f"{prefix}: data_source 必须是非空字符串")
+
+
+def _protocol_for_path(path: Path, protocol: str) -> str:
+    if protocol not in {"auto", "legacy", "names"}:
+        raise ValueError("protocol 必须是 auto、legacy 或 names")
+    if protocol != "auto":
+        return protocol
+    import pyarrow.parquet as pq
+
+    columns = set(pq.read_schema(path).names)
+    if "extra_info" in columns:
+        return "names"
+    if "reward_model" in columns:
+        return "legacy"
+    raise ValueError(f"{path}: 无法从 schema 识别数据协议")
+
+
 def validate_parquet(
-    path: Path, expected_output_k: int = 20, training_stage: str | None = None
+    path: Path,
+    expected_output_k: int = 20,
+    training_stage: str | None = None,
+    protocol: str = "auto",
 ) -> int:
     import pyarrow.parquet as pq
 
+    selected_protocol = _protocol_for_path(path, protocol)
     count = 0
-    for batch in pq.ParquetFile(path).iter_batches(
-        batch_size=1024, columns=["prompt", "extra_info"]
-    ):
+    columns = ["prompt", "extra_info"] if selected_protocol == "names" else [
+        "prompt",
+        "reward_model",
+    ]
+    schema_columns = set(pq.read_schema(path).names)
+    columns = [column for column in columns if column in schema_columns]
+    for batch in pq.ParquetFile(path).iter_batches(batch_size=1024, columns=columns):
         for row in batch.to_pylist():
             count += 1
-            validate_protocol_row(row, path, count, expected_output_k, training_stage)
+            if selected_protocol == "legacy":
+                validate_legacy_row(row, path, count)
+            else:
+                validate_protocol_row(
+                    row, path, count, expected_output_k, training_stage
+                )
     if not count:
         raise ValueError(f"{path} 不包含任何样本")
     return count
@@ -99,9 +152,14 @@ def main() -> None:
     parser.add_argument("--files", type=Path, nargs="+", required=True)
     parser.add_argument("--expected-output-k", type=int, default=20)
     parser.add_argument("--training-stage", choices=STAGES)
+    parser.add_argument(
+        "--protocol", choices=("auto", "legacy", "names"), default="auto"
+    )
     args = parser.parse_args()
     for path in args.files:
-        count = validate_parquet(path, args.expected_output_k, args.training_stage)
+        count = validate_parquet(
+            path, args.expected_output_k, args.training_stage, args.protocol
+        )
         print(f"协议检查通过: {path} ({count} 条)")
 
 

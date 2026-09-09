@@ -1,6 +1,7 @@
 """根据测试输入的症状分布，构造更小的训练子集。
 
-该脚本只读取测试集 ``extra_info.symptoms``，不会读取测试 GT、奖励或候选药材。
+该脚本只读取测试集的症状字段（新协议为 ``extra_info.symptoms``，旧协议为
+顶层 ``symptoms``），不会读取测试 GT、奖励或候选药材。
 它适合缩短开发阶段的 GRPO 训练时间；正式论文实验应同时报告完整训练集结果，
 或将相同筛选协议公平地应用到全部对比方法。
 
@@ -22,6 +23,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -58,14 +60,24 @@ def _symptom_signature(row: dict[str, Any], source: str, row_index: int) -> Symp
     """提取与顺序无关的规范症状组合，并执行严格校验。"""
 
     extra_info = row.get("extra_info")
-    if not isinstance(extra_info, dict):
-        raise ValueError(f"{source} 第 {row_index + 1} 行缺少 extra_info")
-
-    symptoms = extra_info.get("symptoms")
-    if not isinstance(symptoms, list) or not symptoms:
-        raise ValueError(
-            f"{source} 第 {row_index + 1} 行的 extra_info.symptoms 必须是非空列表"
-        )
+    if isinstance(extra_info, dict):
+        symptoms = extra_info.get("symptoms")
+        if not isinstance(symptoms, list) or not symptoms:
+            raise ValueError(
+                f"{source} 第 {row_index + 1} 行的 extra_info.symptoms 必须是非空列表"
+            )
+    else:
+        # 旧版 smart_treatment Parquet 将症状保存为顶层字符串。
+        raw_symptoms = row.get("symptoms")
+        if not isinstance(raw_symptoms, str) or not raw_symptoms.strip():
+            raise ValueError(
+                f"{source} 第 {row_index + 1} 行缺少 extra_info.symptoms 或 symptoms"
+            )
+        symptoms = [
+            item.strip()
+            for item in re.split(r"[、,，;；]", raw_symptoms)
+            if item.strip()
+        ]
 
     cleaned: list[str] = []
     for symptom in symptoms:
@@ -265,8 +277,10 @@ def filter_parquet(
     import pyarrow.parquet as pq
 
     train_table = pq.read_table(train_path)
-    # 测试 Parquet 只加载 extra_info 一列，从数据读取层面排除 GT 和 reward 字段。
-    test_table = pq.read_table(test_path, columns=["extra_info"])
+    # 测试集只加载症状字段，从读取层面排除 GT、候选和 reward。
+    test_schema = set(pq.read_schema(test_path).names)
+    symptom_columns = ["extra_info"] if "extra_info" in test_schema else ["symptoms"]
+    test_table = pq.read_table(test_path, columns=symptom_columns)
     train_rows = train_table.to_pylist()
     test_rows = test_table.to_pylist()
 
@@ -278,6 +292,7 @@ def filter_parquet(
         seed=seed,
         nearest_fallback=nearest_fallback,
     )
+    stats.used_test_fields = tuple(symptom_columns)
     if not indices:
         raise ValueError("筛选后训练集为空，请放宽筛选条件")
 

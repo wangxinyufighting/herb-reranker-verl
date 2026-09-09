@@ -1,8 +1,43 @@
-# 中药候选重排：旧版指标与渐进式 GRPO
+# 中药候选重排：旧版 reward 兼容与渐进式 GRPO
 
-以旧版 reward 的药名输出、GNN 相对增益和天花板保持逻辑为基础，统一数据、训练奖励和离线评价。运行入口是 `herb_reranker/reward.py:compute_score`，不是根目录下的历史 reward 文件。
+默认运行入口直接使用用户提供的根目录 [`reward.py`](/Users/ganning/Documents/project_python/大模型推理/中药推荐/herb-reranker-verl/reward.py)，奖励计算逻辑保持不变。`herb_reranker/reward.py` 及 `DATA_PROTOCOL=names` 是可选的新药名阶段协议，不会影响旧版训练。
 
-## 本次协议
+## 旧版 reward 兼容模式
+
+用户提供的 `train.parquet` 和 `test.parquet` 已经是 VERL 可直接读取的格式，包含 `prompt`、`reward_model.ground_truth`、`symptoms` 和 `data_source`，不需要再次经过 `prepare_data` 构造。把数据目录和根目录 `reward.py` 一起上传服务器后，默认命令即可启动旧版 reward：
+
+```bash
+DATA_ROOT=/path/tcm_herb_rerank_c50_k20_v_smart_treatment_0606 \
+MODEL_PATH=/path/Qwen3-1.7B VERL_ROOT=/path/verl \
+bash scripts/train.sh
+```
+
+训练脚本默认读取 `${DATA_ROOT}/train.parquet`，验证读取 `${DATA_ROOT}/test.parquet`；也可以分别覆盖 `TRAIN_FILES`、`VAL_FILES`。旧版 reward 的阶段 profile 通过 `TCM_REWARD_STAGE=stage1|stage2|stage3` 选择，默认是 `stage1`。训练前的协议检查：
+
+```bash
+python -m herb_reranker.validate_parquet --protocol legacy \
+  --files /path/.../train.parquet /path/.../test.parquet
+```
+
+推理和离线 reward 评测同样支持旧版 Parquet。旧版数据没有 `sample_id`，适配层使用稳定的 1-based 行号（`row-1`、`row-2`）关联预测，不会把 GT 发给模型：
+
+```bash
+python -m herb_reranker.predict \
+  --data /path/.../test.parquet --output outputs/test.pred.jsonl --model herb-model
+python -m herb_reranker.evaluate \
+  --data /path/.../test.parquet --predictions outputs/test.pred.jsonl
+```
+
+`predict` 输出中的 `row_index`/`sample_id` 仅用于本地对齐；实际 reward 调用仍是根目录 `reward.py:compute_score`。数据筛选脚本也能识别旧版顶层 `symptoms`：
+
+```bash
+DATA_PROTOCOL=legacy DATA_ROOT=/path/tcm_herb_rerank_c50_k20_v_smart_treatment_0606 \
+  bash scripts/filter_train_by_test.sh
+```
+
+下面的“新协议”部分只适用于显式设置 `DATA_PROTOCOL=names` 的实验。
+
+## 新 names 协议（可选）
 
 - 输入保留规范症状列表、**原始症状描述**、GNN 原始候选药名顺序，不再使用治法，也不把同症状病例合并成一条。
 - 输出 `<answer>药名1>药名2>...</answer>`，至少 20 味互不重复的候选药，建议仅输出 20 味。允许更多合法药名，评价只取前 20。
@@ -10,7 +45,7 @@
 - 不输出候选 ID，不置换 ID，不做别名映射，不用 GNN/GT 自动补齐模型答案。
 - 训练默认丢弃无可达 GT 病例，验证和测试保留。原始数据、预测、Parquet 和 checkpoint 不上传 Git。
 
-## 指标与 Reward
+## 新 names 协议的指标与 Reward
 
 所有指标来自同一个 `ranking_metrics` 函数：
 
@@ -43,7 +78,7 @@
 
 注意：GRPO 同组减去相同 GNN baseline 会在中心化中抵消，不能把它本身当成防复制机制。真正的排序信号来自命中数/NDCG、冻结头部参考及合法性约束。Reward 的优先级也不等于优化器对最终模型给出“不退步”的数学保证，仍须检查验证集的 P/R/F1 和 `reference_deficit_5/10`。
 
-## 构建数据
+## 构建新 names 数据
 
 ```bash
 pip install -r requirements.txt
@@ -87,7 +122,7 @@ python -m herb_reranker.prepare_data \
 
 ## 按测试症状筛选训练子集
 
-原来的筛选代码仍然保留：`herb_reranker/filter_train_by_test.py` 和 `scripts/filter_train_by_test.sh`。只使用测试输入的 `extra_info.symptoms` 决定选择，不使用测试 GT、reward、候选排序或上一阶段参考。
+原来的筛选代码仍然保留：`herb_reranker/filter_train_by_test.py` 和 `scripts/filter_train_by_test.sh`。只使用测试输入的症状字段决定选择（新协议读取 `extra_info.symptoms`，旧协议读取顶层 `symptoms`），不使用测试 GT、reward、候选排序或上一阶段参考。
 
 ```bash
 TRAINING_STAGE=stage1 FILTER_MODE=matched TRAIN_PER_TEST=2 \
@@ -102,14 +137,14 @@ TRAINING_STAGE=stage1 \
 
 这是使用测试输入分布的开发/传导式实验选项，不是默认的独立留出评测流程；正式比较应明确报告筛选协议，并同时报告完整训练集结果。不得用测试 GT 选择病例或 checkpoint。
 
-## 逐阶段训练
+## 新 names 协议的逐阶段训练
 
 ```bash
 TRAINING_STAGE=stage1 MODEL_PATH=/path/base-model \
   VERL_ROOT=/path/verl bash scripts/train.sh
 ```
 
-默认训练文件为 `data/processed/{stage}/train_top50.parquet`，验证文件为同目录 `val.parquet`。也可明确传入 `TRAIN_FILES` 和 `VAL_FILES`。不再默认把测试集当验证集。训练前会检查药名协议、指标口径、阶段、输入指纹和参考。
+设置 `DATA_PROTOCOL=names` 后，默认训练文件为 `data/processed/{stage}/train_top50.parquet`，验证文件为同目录 `val.parquet`。也可明确传入 `TRAIN_FILES` 和 `VAL_FILES`。训练前会检查药名协议、指标口径、阶段、输入指纹和参考。
 
 Stage 1 完成后，根据**验证集**选择 checkpoint，导出为可推理的模型并部署本地兼容 `/v1/chat/completions` 的服务。以下以服务模型名 `stage1-selected` 为例：
 

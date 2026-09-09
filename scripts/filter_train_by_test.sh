@@ -7,8 +7,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 CANDIDATE_K="${CANDIDATE_K:-50}"
+DATA_PROTOCOL="${DATA_PROTOCOL:-legacy}"
 TRAINING_STAGE="${TRAINING_STAGE:-stage1}"
-STAGE_DIR="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}"
+if [[ "${DATA_PROTOCOL}" == "legacy" ]]; then
+  STAGE_DIR="${DATA_ROOT:-${PROJECT_ROOT}/data/tcm_herb_rerank_c50_k20_v_smart_treatment_0606}"
+else
+  STAGE_DIR="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}"
+fi
 if [[ -n "${TRAIN_PARQUET:-}" ]]; then
   TRAIN_PARQUET="${TRAIN_PARQUET}"
 elif [[ -f "${STAGE_DIR}/train_top${CANDIDATE_K}.parquet" ]]; then
@@ -26,6 +31,8 @@ elif [[ -f "${PROJECT_ROOT}/data/processed/stage1/test_top${CANDIDATE_K}.parquet
   TEST_PARQUET="${PROJECT_ROOT}/data/processed/stage1/test_top${CANDIDATE_K}.parquet"
 elif [[ -f "${PROJECT_ROOT}/data/processed/test_top${CANDIDATE_K}.parquet" ]]; then
   TEST_PARQUET="${PROJECT_ROOT}/data/processed/test_top${CANDIDATE_K}.parquet"
+elif [[ -f "${STAGE_DIR}/test.parquet" ]]; then
+  TEST_PARQUET="${STAGE_DIR}/test.parquet"
 else
   TEST_PARQUET="${PROJECT_ROOT}/data/processed/test.parquet"
 fi
@@ -72,4 +79,4 @@ python3 -m herb_reranker.filter_train_by_test \
 
 echo
 echo "训练时使用："
-echo "TRAINING_STAGE=${TRAINING_STAGE} TRAIN_FILES=${OUTPUT_PARQUET} bash scripts/train.sh"
+echo "DATA_PROTOCOL=${DATA_PROTOCOL} TRAINING_STAGE=${TRAINING_STAGE} TRAIN_FILES=${OUTPUT_PARQUET} bash scripts/train.sh"

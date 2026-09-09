@@ -7,11 +7,84 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 from pathlib import Path
 
+from .legacy_data import iter_parquet_rows, legacy_ground_truth, legacy_row_id
 from .prepare_data import _convert_record, read_jsonl
 from .reward import parse_answer, ranking_metrics, validate_reference
+
+
+def _solution_from_prediction(item: dict, key: str) -> str:
+    if "ranking" in item:
+        ranking = item["ranking"]
+        if not isinstance(ranking, list) or not all(
+            isinstance(name, str) for name in ranking
+        ):
+            raise ValueError(f"{key}: ranking 必须是药名列表")
+        return "<answer>" + ">".join(ranking) + "</answer>"
+    return str(item.get("output", ""))
+
+
+def _load_legacy_reward():
+    """加载仓库根目录的历史 reward，避免被同名第三方模块遮蔽。"""
+
+    path = Path(__file__).resolve().parents[1] / "reward.py"
+    spec = importlib.util.spec_from_file_location("historical_herb_reward", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载旧版 reward: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def evaluate_legacy_parquet(
+    data: Path, predictions: Path
+) -> dict[str, float]:
+    """用根目录旧 reward 评测已经构造好的 VERL Parquet。"""
+
+    legacy_reward = _load_legacy_reward()
+
+    indexed: dict[str, dict] = {}
+    for item in read_jsonl(predictions):
+        row_index = item.get("row_index")
+        if isinstance(row_index, int) and row_index > 0:
+            key = legacy_row_id(row_index)
+        else:
+            key = item.get("sample_id")
+        if not isinstance(key, str) or not key or key in indexed:
+            raise ValueError("旧版预测中的 row_index/sample_id 缺失或重复")
+        indexed[key] = item
+
+    sums: dict[str, float] = {}
+    seen: set[str] = set()
+    for row_number, row in iter_parquet_rows(data):
+        key = legacy_row_id(row_number)
+        if key not in indexed:
+            raise ValueError(f"{key}: 预测缺失")
+        if key in seen:
+            raise ValueError(f"{key}: 数据重复")
+        seen.add(key)
+        ground_truth = legacy_ground_truth(row, f"{data} 第 {row_number} 条")
+        solution = _solution_from_prediction(indexed[key], key)
+        result = legacy_reward.compute_score(
+            solution,
+            ground_truth,
+            row.get("data_source", ""),
+            {},
+        )
+        if not isinstance(result, dict):
+            raise ValueError("旧 reward 必须返回包含 score 的字典")
+        for name, value in result.items():
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                sums[name] = sums.get(name, 0.0) + float(value)
+
+    if set(indexed) != seen or not seen:
+        raise ValueError("预测与旧版 Parquet 的 row_index 必须完全对应且非空")
+    output = {name: value / len(seen) for name, value in sums.items()}
+    output["sample_count"] = float(len(seen))
+    return output
 
 
 def evaluate(
@@ -21,6 +94,11 @@ def evaluate(
     reference_output: Path | None = None,
     checkpoint_id: str | None = None,
 ) -> dict[str, float]:
+    if data.suffix.lower() == ".parquet":
+        if reference_output is not None or checkpoint_id is not None:
+            raise ValueError("旧版 reward 不支持导出阶段 reference")
+        return evaluate_legacy_parquet(data, predictions)
+
     indexed = {}
     for item in read_jsonl(predictions):
         key = item.get("sample_id")
@@ -37,15 +115,7 @@ def evaluate(
             raise ValueError(f"{key}: 数据 ID 重复或预测缺失")
         seen.add(key)
         item = indexed[key]
-        if "ranking" in item:
-            raw = item["ranking"]
-            if not isinstance(raw, list) or not all(
-                isinstance(name, str) for name in raw
-            ):
-                raise ValueError(f"{key}: ranking 必须是药名列表")
-            solution = "<answer>" + ">".join(raw) + "</answer>"
-        else:
-            solution = str(item.get("output", ""))
+        solution = _solution_from_prediction(item, key)
         ranking, valid, _ = parse_answer(solution)
         try:
             validate_reference(ranking, info["candidate_herbs"], output_k)

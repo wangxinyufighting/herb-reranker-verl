@@ -2,34 +2,49 @@
 set -euo pipefail
 
 # 底层训练入口；通常直接运行同目录下的 train.sh。
+# 默认使用仓库根目录的旧版 reward.py 和已经构造好的 train/test Parquet。
 # VERL_ROOT 必须指向已经安装依赖的 VERL 仓库；本工程不会修改其中任何文件。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 VERL_ROOT="${VERL_ROOT:-/root/autodl-tmp/verl}"
 EXP_TAG="${EXP_TAG:-v1}"
-TRAINING_STAGE="${TRAINING_STAGE:-stage1}"
-case "${TRAINING_STAGE}" in
-  stage1|stage2|stage3) ;;
-  *) echo "TRAINING_STAGE 必须是 stage1、stage2 或 stage3" >&2; exit 1 ;;
+DATA_PROTOCOL="${DATA_PROTOCOL:-legacy}"
+case "${DATA_PROTOCOL}" in
+  legacy)
+    # 上传服务器时可直接覆盖 DATA_ROOT，或分别覆盖 TRAIN_FILES/VAL_FILES。
+    DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/data/tcm_herb_rerank_c50_k20_v_smart_treatment_0606}"
+    TRAIN_FILES="${TRAIN_FILES:-${DATA_ROOT}/train.parquet}"
+    VAL_FILES="${VAL_FILES:-${DATA_ROOT}/test.parquet}"
+    REWARD_FUNCTION_PATH="${REWARD_FUNCTION_PATH:-${PROJECT_ROOT}/reward.py}"
+    TCM_REWARD_STAGE="${TCM_REWARD_STAGE:-stage1}"
+    export TCM_REWARD_STAGE
+    VALIDATE_PROTOCOL=legacy
+    EXPERIMENT_STAGE="${TCM_REWARD_STAGE}"
+    ;;
+  names)
+    TRAINING_STAGE="${TRAINING_STAGE:-stage1}"
+    case "${TRAINING_STAGE}" in
+      stage1|stage2|stage3) ;;
+      *) echo "TRAINING_STAGE 必须是 stage1、stage2 或 stage3" >&2; exit 1 ;;
+    esac
+    if [[ -z "${TRAIN_FILES:-}" ]]; then
+      if [[ -f "${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train_top50.parquet" ]]; then
+        TRAIN_FILES="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train_top50.parquet"
+      else
+        TRAIN_FILES="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train.parquet"
+      fi
+    fi
+    VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/val.parquet}"
+    if [[ "${TRAINING_STAGE}" != stage1 && -z "${MODEL_PATH:-}" ]]; then
+      echo "Stage 2/3 必须指定上一阶段选定的 MODEL_PATH" >&2
+      exit 1
+    fi
+    REWARD_FUNCTION_PATH="${REWARD_FUNCTION_PATH:-${PROJECT_ROOT}/herb_reranker/reward.py}"
+    VALIDATE_PROTOCOL=names
+    EXPERIMENT_STAGE="${TRAINING_STAGE}"
+    ;;
+  *) echo "DATA_PROTOCOL 必须是 legacy 或 names" >&2; exit 1 ;;
 esac
-if [[ -n "${REWARD_MODE:-}" || -n "${HIERARCHICAL_REWARD:-}" ]]; then
-  echo "旧 reward 配置已停用，请改用 TRAINING_STAGE" >&2
-  exit 1
-fi
-
-if [[ -z "${TRAIN_FILES:-}" ]]; then
-  if [[ -f "${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train_top50.parquet" ]]; then
-    TRAIN_FILES="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train_top50.parquet"
-  else
-    # ``prepare_data.sh`` (the small JSONL/example path) uses the shorter name.
-    TRAIN_FILES="${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/train.parquet"
-  fi
-fi
-VAL_FILES="${VAL_FILES:-${PROJECT_ROOT}/data/processed/${TRAINING_STAGE}/val.parquet}"
-if [[ "${TRAINING_STAGE}" != stage1 && -z "${MODEL_PATH:-}" ]]; then
-  echo "Stage 2/3 必须指定上一阶段选定的 MODEL_PATH" >&2
-  exit 1
-fi
 MODEL_PATH="${MODEL_PATH:-/root/autodl-tmp/models/Qwen3-1.7B}"
 
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-3}"
@@ -57,7 +72,7 @@ NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-true}"
 
 PROJECT_NAME="${PROJECT_NAME:-herb-reranker}"
 MODEL_NAME="${MODEL_PATH##*/}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-names-${TRAINING_STAGE}-${EXP_TAG}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-${DATA_PROTOCOL}-${EXPERIMENT_STAGE}-${EXP_TAG}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/${EXPERIMENT_NAME}}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-20}"
@@ -80,11 +95,11 @@ fi
 # 通过 PYTHONPATH 引用外部仓库，不复制也不修改 VERL 源码。
 export PYTHONPATH="${PROJECT_ROOT}:${VERL_ROOT}:${PYTHONPATH:-}"
 
-# 防止旧 ID 数据或其他训练阶段的 Parquet 静默混用。
+# 防止数据协议或字段不完整的 Parquet 静默进入训练。
 python3 -m herb_reranker.validate_parquet \
   --files "${TRAIN_FILES}" "${VAL_FILES}" \
-  --expected-output-k "${OUTPUT_K}" \
-  --training-stage "${TRAINING_STAGE}"
+  --protocol "${VALIDATE_PROTOCOL}" \
+  --expected-output-k "${OUTPUT_K}"
 
 cd "${VERL_ROOT}"
 
@@ -129,11 +144,8 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
   actor_rollout_ref.ref.fsdp_config.param_offload=False \
   reward.reward_manager.name=naive \
-  reward.custom_reward_function.path="${PROJECT_ROOT}/herb_reranker/reward.py" \
+  reward.custom_reward_function.path="${REWARD_FUNCTION_PATH}" \
   reward.custom_reward_function.name=compute_score \
-  +reward.custom_reward_function.reward_kwargs.training_stage="${TRAINING_STAGE}" \
-  +reward.custom_reward_function.reward_kwargs.output_k="${OUTPUT_K}" \
-  +reward.custom_reward_function.reward_kwargs.format_weight=0.1 \
   +actor_rollout_ref.model.override_config.attn_implementation=sdpa \
   trainer.project_name="${PROJECT_NAME}" \
   trainer.experiment_name="${EXPERIMENT_NAME}" \
