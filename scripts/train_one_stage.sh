@@ -133,7 +133,7 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-  +actor_rollout_ref.actor.fsdp_config.model_dtype="${ACTOR_MODEL_DTYPE}" \
+  actor_rollout_ref.actor.fsdp_config.model_dtype="${ACTOR_MODEL_DTYPE}" \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
