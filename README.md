@@ -14,6 +14,8 @@ bash scripts/train.sh
 
 训练脚本默认读取 `${DATA_ROOT}/train.parquet`，验证读取 `${DATA_ROOT}/test.parquet`；也可以分别覆盖 `TRAIN_FILES`、`VAL_FILES`。旧版 reward 的阶段 profile 通过 `TCM_REWARD_STAGE=stage1|stage2|stage3` 选择，默认是 `stage1`。训练前的协议检查：
 
+训练默认使用 BF16：actor 的 FSDP 模型 dtype 为 `bf16`，vLLM rollout dtype 为 `bfloat16`。实验名会包含 actor dtype，避免与旧精度 checkpoint 混用。如需切换，可分别覆盖 `ACTOR_MODEL_DTYPE` 和 `ROLLOUT_DTYPE`。
+
 ```bash
 python -m herb_reranker.validate_parquet --protocol legacy \
   --files /path/.../train.parquet /path/.../test.parquet

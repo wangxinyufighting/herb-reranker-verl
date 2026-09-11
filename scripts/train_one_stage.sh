@@ -59,6 +59,10 @@ PPO_MICRO_BATCH_SIZE_PER_GPU="${PPO_MICRO_BATCH_SIZE_PER_GPU:-4}"
 LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-8}"
 ROLLOUT_N="${ROLLOUT_N:-16}"
 ROLLOUT_TP="${ROLLOUT_TP:-1}"
+# Use BF16 for the actor model and align the vLLM rollout dtype. Override either
+# value when running on hardware or a VERL build with a different dtype policy.
+ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-bf16}"
+ROLLOUT_DTYPE="${ROLLOUT_DTYPE:-bfloat16}"
 OUTPUT_K="${OUTPUT_K:-20}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.6}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
@@ -72,7 +76,7 @@ NORM_ADV_BY_STD="${NORM_ADV_BY_STD:-true}"
 
 PROJECT_NAME="${PROJECT_NAME:-herb-reranker}"
 MODEL_NAME="${MODEL_PATH##*/}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-${DATA_PROTOCOL}-${EXPERIMENT_STAGE}-${EXP_TAG}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_NAME}-${DATA_PROTOCOL}-${EXPERIMENT_STAGE}-${ACTOR_MODEL_DTYPE}-${EXP_TAG}}"
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-${PROJECT_ROOT}/checkpoints/${EXPERIMENT_NAME}}"
 SAVE_FREQ="${SAVE_FREQ:-50}"
 TEST_FREQ="${TEST_FREQ:-20}"
@@ -129,9 +133,11 @@ python3 -m verl.trainer.main_ppo \
   actor_rollout_ref.actor.use_dynamic_bsz=True \
   actor_rollout_ref.actor.fsdp_config.param_offload=False \
   actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+  +actor_rollout_ref.actor.fsdp_config.model_dtype="${ACTOR_MODEL_DTYPE}" \
   actor_rollout_ref.rollout.name=vllm \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP}" \
+  actor_rollout_ref.rollout.dtype="${ROLLOUT_DTYPE}" \
   actor_rollout_ref.rollout.gpu_memory_utilization="${GPU_MEMORY_UTILIZATION}" \
   actor_rollout_ref.rollout.temperature="${ROLLOUT_TEMPERATURE}" \
   actor_rollout_ref.rollout.top_p="${ROLLOUT_TOP_P}" \
